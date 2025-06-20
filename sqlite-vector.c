@@ -806,8 +806,10 @@ void *vector_context_create (void) {
 
 table_context *vector_context_lookup (vector_context *ctx, const char *table_name, const char *column_name) {
     for (int i=0; i<ctx->table_count; ++i) {
-        if ((strcasecmp(ctx->tables[i].t_name, table_name) == 0) &&
-            (strcasecmp(ctx->tables[i].c_name, column_name) == 0)) return &ctx->tables[i];
+        // tname and cname can be NULL after adding vector_cleanup function
+        const char *tname = ctx->tables[i].t_name;
+        const char *cname = ctx->tables[i].c_name;
+        if (tname && cname && (strcasecmp(tname, table_name) == 0) && (strcasecmp(cname, column_name) == 0)) return &ctx->tables[i];
     }
     return NULL;
 }
@@ -1148,6 +1150,33 @@ vector_preload_cleanup:
     if (rc != SQLITE_OK) printf("Error in vector_quantize_preload: %s\n", sqlite3_errmsg(db));
     if (vm) sqlite3_finalize(vm);
     return;
+}
+
+static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_cleanup", argc, argv, 2, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    
+    vector_context *v_ctx = (vector_context *)sqlite3_user_data(context);
+    table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
+    if (!t_ctx) return; // if no table context exists then do nothing
+    
+    // release memory
+    if (t_ctx->t_name) sqlite3_free(t_ctx->t_name);
+    if (t_ctx->c_name) sqlite3_free(t_ctx->c_name);
+    if (t_ctx->pk_name) sqlite3_free(t_ctx->pk_name);
+    if (t_ctx->preloaded) sqlite3_free(t_ctx->preloaded);
+    memset(t_ctx, 0, sizeof(table_context));
+    
+    // drop quant table (if any)
+    char sql[STATIC_SQL_SIZE];
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    generate_drop_quant_table(table_name, column_name, sql);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    
+    // do not decrease v_ctx->table_count
 }
 
 // MARK: -
@@ -1816,6 +1845,10 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     
     // table_name, column_name
     rc = sqlite3_create_function(db, "vector_quantize_preload", 2, SQLITE_UTF8, ctx, vector_quantize_preload, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    // table_name, column_name
+    rc = sqlite3_create_function(db, "vector_cleanup", 2, SQLITE_UTF8, ctx, vector_cleanup, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_module(db, "vector_full_scan", &vFullScanModule, ctx);
