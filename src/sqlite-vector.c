@@ -1,12 +1,13 @@
 //
 //  sqlite-vector.c
-//  sqlitevector_test
+//  sqlitevector
 //
 //  Created by Marco Bambini on 16/06/25.
 //
 
-#include "sqlite-vector.h"
 #include "fp16/fp16.h"
+#include "sqlite-vector.h"
+#include "distance-cpu.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -17,10 +18,6 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#endif
 
 #define DEBUG_VECTOR_ALWAYS(...)                    do {printf(__VA_ARGS__ );printf("\n");} while (0)
 
@@ -74,26 +71,6 @@
 #define OPTION_KEY_QUANTTYPE                        "quant_type"
 #define OPTION_KEY_DISTANCE                         "distance"
 
-typedef enum {
-    VECTOR_TYPE_F32 = 1,
-    VECTOR_TYPE_F16,
-    VECTOR_TYPE_BF16,
-    VECTOR_TYPE_U8,
-    VECTOR_TYPE_I8,
-} vector_type;
-
-typedef enum {
-    VECTOR_QUANT_8BIT = 1
-} vector_qtype;
-
-typedef enum {
-    VECTOR_DISTANCE_L2 = 1,
-    VECTOR_DISTANCE_SQUARED_L2 = 2,
-    VECTOR_DISTANCE_COSINE = 3,
-    VECTOR_DISTANCE_DOT = 4,
-    VECTOR_DISTANCE_L1 = 5
-} vector_distance;
-
 typedef struct {
     vector_type     v_type;                 // vector type
     int             v_dim;                  // vector dimension
@@ -146,19 +123,75 @@ typedef bool (*keyvalue_callback)(sqlite3_context *context, void *xdata, const c
 typedef int (*vcursor_run_callback)(sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size);
 typedef int (*vcursor_sort_callback)(vFullScanCursor *c);
 
+extern distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX];
+extern char *distance_backend_name;
+
 // MARK: - BFLOAT16 -
 
-typedef uint16_t bfloat16;
+// there is a native bfloat16_t ARM intrinsic
 
-static inline bfloat16 float32_to_bfloat16 (float f) {
+typedef uint16_t float16_t;
+typedef uint16_t bfloat16_t;
+
+/*
+static inline bfloat16_t float32_to_bfloat16 (float f) {
     uint32_t bits = *(uint32_t *)&f;
-    return (bfloat16)(bits >> 16);
+    return (bfloat16_t)(bits >> 16);
 }
 
-static inline float bfloat16_to_float32 (bfloat16 bf) {
+static inline float bfloat16_to_float32 (bfloat16_t bf) {
     uint32_t bits = ((uint32_t)bf) << 16;
     return *(float *)&bits;
 }
+ */
+
+// MARK: - Quantization -
+
+/*
+static inline void quantize_float32_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
+    for (int i=0; i<n; ++i) {
+        float scaled = (v[i] - offset) * scale;
+        //v[i] = (uint8_t)fminf(255.0f, fmaxf(0.0f, roundf(scaled)));
+        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));   // branchless round
+        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);            // clamp to [0, 255]
+        q[i] = (uint8_t)rounded;
+    }
+}
+ */
+
+static inline void float32_quantize_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float s0 = (v[i]     - offset) * scale;
+        float s1 = (v[i + 1] - offset) * scale;
+        float s2 = (v[i + 2] - offset) * scale;
+        float s3 = (v[i + 3] - offset) * scale;
+
+        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
+        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
+        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
+        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
+
+        r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
+        r1 = r1 > 255 ? 255 : (r1 < 0 ? 0 : r1);
+        r2 = r2 > 255 ? 255 : (r2 < 0 ? 0 : r2);
+        r3 = r3 > 255 ? 255 : (r3 < 0 ? 0 : r3);
+
+        q[i]     = (uint8_t)r0;
+        q[i + 1] = (uint8_t)r1;
+        q[i + 2] = (uint8_t)r2;
+        q[i + 3] = (uint8_t)r3;
+    }
+
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        float scaled = (v[i] - offset) * scale;
+        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
+        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);
+        q[i] = (uint8_t)rounded;
+    }
+}
+
 
 // MARK: - SQLite Utils -
 
@@ -367,7 +400,7 @@ static size_t vector_type_to_size (vector_type type) {
     switch (type) {
         case VECTOR_TYPE_F32: return sizeof(float);
         case VECTOR_TYPE_F16: return sizeof(uint16_t);
-        case VECTOR_TYPE_BF16: return sizeof(bfloat16);
+        case VECTOR_TYPE_BF16: return sizeof(uint16_t/*bfloat16*/); // TODO: FIX ME
         case VECTOR_TYPE_U8: return sizeof(uint8_t);
         case VECTOR_TYPE_I8: return sizeof(int8_t);
     }
@@ -542,230 +575,6 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
     
     // means ignore unknown keys
     return true;
-}
-
-// MARK: - Distance L2 -
-
-static inline float float32_distance_l2 (float *v1, float *v2, int n, bool use_sqrt) {
-    float sum_sq = 0.0f;
-    int i = 0;
-    
-    if (n >= 4) {
-        // unroll the loop 4 times
-        for (; i <= n - 4; i += 4) {
-            float d0 = v1[i] - v2[i];
-            float d1 = v1[i+1] - v2[i+1];
-            float d2 = v1[i+2] - v2[i+2];
-            float d3 = v1[i+3] - v2[i+3];
-            sum_sq += d0*d0 + d1*d1 + d2*d2 + d3*d3;
-        }
-    }
-    
-    // tail loop
-    for (; i < n; i++) {
-        float d = v1[i] - v2[i];
-        sum_sq += d * d;
-    }
-    
-    return use_sqrt ? sqrtf(sum_sq) : sum_sq;
-}
-
-static inline float float32_distance_cosine (float *v1, float *v2, int n) {
-    float dot = 0.0f;
-    float norm_x = 0.0f;
-    float norm_y = 0.0f;
-    int i = 0;
-    
-    // unroll the loop 4 times
-    for (; i <= n - 4; i += 4) {
-        float x0 = v1[i],     y0 = v2[i];
-        float x1 = v1[i + 1], y1 = v2[i + 1];
-        float x2 = v1[i + 2], y2 = v2[i + 2];
-        float x3 = v1[i + 3], y3 = v2[i + 3];
-        
-        dot     += x0*y0 + x1*y1 + x2*y2 + x3*y3;
-        norm_x  += x0*x0 + x1*x1 + x2*x2 + x3*x3;
-        norm_y  += y0*y0 + y1*y1 + y2*y2 + y3*y3;
-    }
-    
-    // tail loop
-    for (; i < n; i++) {
-        float x = v1[i];
-        float y = v2[i];
-        dot    += x * y;
-        norm_x += x * x;
-        norm_y += y * y;
-    }
-    
-    // max distance if one vector is zero
-    if (norm_x == 0.0f || norm_y == 0.0f) {
-        return 1.0f;
-    }
-    
-    return 1.0f - (dot / (sqrtf(norm_x) * sqrtf(norm_y)));
-}
-
-static inline float float32_distance_dot (float *v1, float *v2, int n) {
-    float dot = 0.0f;
-    int i = 0;
-    
-    // unroll the loop 4 times
-    for (; i <= n - 4; i += 4) {
-        float x0 = v1[i],     y0 = v2[i];
-        float x1 = v1[i + 1], y1 = v2[i + 1];
-        float x2 = v1[i + 2], y2 = v2[i + 2];
-        float x3 = v1[i + 3], y3 = v2[i + 3];
-        dot += x0*y0 + x1*y1 + x2*y2 + x3*y3;
-    }
-    
-    // tail loop
-    for (; i < n; i++) {
-        float x = v1[i];
-        float y = v2[i];
-        dot += x * y;
-    }
-    
-    return 1.0f - dot;
-}
-
-static inline float float32_distance_l1(float *v1, float *v2, int n) {
-    float sum = 0.0f;
-    int i = 0;
-
-    // unroll the loop 4 times
-    for (; i <= n - 4; i += 4) {
-        sum += fabsf(v1[i]     - v2[i]);
-        sum += fabsf(v1[i + 1] - v2[i + 1]);
-        sum += fabsf(v1[i + 2] - v2[i + 2]);
-        sum += fabsf(v1[i + 3] - v2[i + 3]);
-    }
-
-    // tail loop
-    for (; i < n; ++i) {
-        sum += fabsf(v1[i] - v2[i]);
-    }
-
-    return sum;
-}
-
-static inline uint32_t distance_lut16x(const uint8_t *a, const uint8_t *b, int dim) {
-#if 1
-    uint32_t sum = 0;
-    int i = 0;
-    
-    for (; i <= dim - 16; i += 16) {
-        // Load 16 bytes from a and b
-        uint8x16_t va = vld1q_u8(a + i);
-        uint8x16_t vb = vld1q_u8(b + i);
-        
-        // Compute difference (abs diff is fine for squared diff)
-        int16x8_t d0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(va), vget_low_u8(vb)));
-        int16x8_t d1 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(va), vget_high_u8(vb)));
-        
-        // Square differences
-        int32x4_t s0 = vmull_s16(vget_low_s16(d0), vget_low_s16(d0));
-        int32x4_t s1 = vmull_s16(vget_high_s16(d0), vget_high_s16(d0));
-        int32x4_t s2 = vmull_s16(vget_low_s16(d1), vget_low_s16(d1));
-        int32x4_t s3 = vmull_s16(vget_high_s16(d1), vget_high_s16(d1));
-        
-        // Sum all lanes
-        sum += vaddvq_s32(s0);
-        sum += vaddvq_s32(s1);
-        sum += vaddvq_s32(s2);
-        sum += vaddvq_s32(s3);
-    }
-    
-    // Handle tail (scalar fallback)
-    for (; i < dim; ++i) {
-        int diff = (int)a[i] - (int)b[i];
-        sum += diff * diff;
-    }
-    
-    return sqrtf((float)sum);
-#endif
-    
-#if 0
-    uint32_t sum = 0;
-    int i = 0;
-    
-    // process 16 elements per iteration
-    for (; i <= dim - 16; i += 16) {
-        #if USE_1D_LOOKUP_TABLE
-        sum += sq_lut[(a[i] << 8) | b[i]];
-        sum += sq_lut[(a[i+1] << 8) | b[i+1]];
-        sum += sq_lut[(a[i+2] << 8) | b[i+2]];
-        sum += sq_lut[(a[i+3] << 8) | b[i+3]];
-        sum += sq_lut[(a[i+4] << 8) | b[i+4]];
-        sum += sq_lut[(a[i+5] << 8) | b[i+5]];
-        sum += sq_lut[(a[i+6] << 8) | b[i+6]];
-        sum += sq_lut[(a[i+7] << 8) | b[i+7]];
-        sum += sq_lut[(a[i+8] << 8) | b[i+8]];
-        sum += sq_lut[(a[i+9] << 8) | b[i+9]];
-        sum += sq_lut[(a[i+10] << 8) | b[i+10]];
-        sum += sq_lut[(a[i+11] << 8) | b[i+11]];
-        sum += sq_lut[(a[i+12] << 8) | b[i+12]];
-        sum += sq_lut[(a[i+13] << 8) | b[i+13]];
-        sum += sq_lut[(a[i+14] << 8) | b[i+14]];
-        sum += sq_lut[(a[i+15] << 8) | b[i+15]];
-        #else
-        sum += sq_diff[a[i]][b[i]];
-        sum += sq_diff[a[i+1]][b[i+1]];
-        sum += sq_diff[a[i+2]][b[i+2]];
-        sum += sq_diff[a[i+3]][b[i+3]];
-        sum += sq_diff[a[i+4]][b[i+4]];
-        sum += sq_diff[a[i+5]][b[i+5]];
-        sum += sq_diff[a[i+6]][b[i+6]];
-        sum += sq_diff[a[i+7]][b[i+7]];
-        sum += sq_diff[a[i+8]][b[i+8]];
-        sum += sq_diff[a[i+9]][b[i+9]];
-        sum += sq_diff[a[i+10]][b[i+10]];
-        sum += sq_diff[a[i+11]][b[i+11]];
-        sum += sq_diff[a[i+12]][b[i+12]];
-        sum += sq_diff[a[i+13]][b[i+13]];
-        sum += sq_diff[a[i+14]][b[i+14]];
-        sum += sq_diff[a[i+15]][b[i+15]];
-        #endif
-    }
-    
-    // handle remaining elements (if dim is not a multiple of 16)
-    switch (dim - i) {
-        #if USE_1D_LOOKUP_TABLE
-        case 15: sum += sq_lut[(a[i+14] << 8) | b[i+14]]; /* fall through */
-        case 14: sum += sq_lut[(a[i+13] << 8) | b[i+13]]; /* fall through */
-        case 13: sum += sq_lut[(a[i+12] << 8) | b[i+12]]; /* fall through */
-        case 12: sum += sq_lut[(a[i+11] << 8) | b[i+11]]; /* fall through */
-        case 11: sum += sq_lut[(a[i+10] << 8) | b[i+10]]; /* fall through */
-        case 10: sum += sq_lut[(a[i+9] << 8) | b[i+9]]; /* fall through */
-        case 9: sum += sq_lut[(a[i+8] << 8) | b[i+8]]; /* fall through */
-        case 8: sum += sq_lut[(a[i+7] << 8) | b[i+7]]; /* fall through */
-        case 7: sum += sq_lut[(a[i+6] << 8) | b[i+6]]; /* fall through */
-        case 6: sum += sq_lut[(a[i+5] << 8) | b[i+5]]; /* fall through */
-        case 5: sum += sq_lut[(a[i+4] << 8) | b[i+4]]; /* fall through */
-        case 4: sum += sq_lut[(a[i+3] << 8) | b[i+3]]; /* fall through */
-        case 3: sum += sq_lut[(a[i+2] << 8) | b[i+2]]; /* fall through */
-        case 2: sum += sq_lut[(a[i+1] << 8) | b[i+1]]; /* fall through */
-        case 1: sum += sq_lut[(a[i] << 8) | b[i]];
-        #else
-        case 15: sum += sq_diff[a[i+14]][b[i+14]]; /* fall through */
-        case 14: sum += sq_diff[a[i+13]][b[i+13]]; /* fall through */
-        case 13: sum += sq_diff[a[i+12]][b[i+12]]; /* fall through */
-        case 12: sum += sq_diff[a[i+11]][b[i+11]]; /* fall through */
-        case 11: sum += sq_diff[a[i+10]][b[i+10]]; /* fall through */
-        case 10: sum += sq_diff[a[i+9]][b[i+9]]; /* fall through */
-        case 9: sum += sq_diff[a[i+8]][b[i+8]]; /* fall through */
-        case 8: sum += sq_diff[a[i+7]][b[i+7]]; /* fall through */
-        case 7: sum += sq_diff[a[i+6]][b[i+6]]; /* fall through */
-        case 6: sum += sq_diff[a[i+5]][b[i+5]]; /* fall through */
-        case 5: sum += sq_diff[a[i+4]][b[i+4]]; /* fall through */
-        case 4: sum += sq_diff[a[i+3]][b[i+3]]; /* fall through */
-        case 3: sum += sq_diff[a[i+2]][b[i+2]]; /* fall through */
-        case 2: sum += sq_diff[a[i+1]][b[i+1]]; /* fall through */
-        case 1: sum += sq_diff[a[i]][b[i]];
-        #endif
-    }
-    
-    return sqrtf((float)sum);
-#endif
 }
 
 // MARK: - SQL -
@@ -977,10 +786,12 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         data += sizeof(int64_t);
         
         // quantize vector
+        float32_quantize_u8(v, data, offset, scale, dim);
+        /*
         for (int i=0; i<dim; ++i) {
             float scaled = (v[i] - offset) * scale;
             data[i] = (uint8_t)fminf(255.0f, fmaxf(0.0f, roundf(scaled)));
-        }
+        }*/
         data += (dim * sizeof(uint8_t));
         
         max_rowid = rowid;
@@ -1211,8 +1022,8 @@ static char *vector_convert_from_json (sqlite3_context *context, vector_type typ
     }
     
     float *float_blob = (float *)blob;
-    uint16_t *uint16_blob = (uint16_t *)blob;
-    bfloat16 *bfloat16_blob = (bfloat16 *)blob;
+    //uint16_t *uint16_blob = (uint16_t *)blob;
+    //bfloat16 *bfloat16_blob = (bfloat16 *)blob;
     uint8_t *uint8_blob = (uint8_t *)blob;
     int8_t *int8_blob = (int8_t *)blob;
     
@@ -1239,12 +1050,12 @@ static char *vector_convert_from_json (sqlite3_context *context, vector_type typ
             case VECTOR_TYPE_F32:
                 float_blob[count++] = (float)value;
                 break;
-            case VECTOR_TYPE_F16:
-                uint16_blob[count++] = fp16_ieee_from_fp32_value((float)value);
-                break;
-            case VECTOR_TYPE_BF16:
-                bfloat16_blob[count++] = float32_to_bfloat16((float)value);
-                break;
+                //case VECTOR_TYPE_F16:
+                //uint16_blob[count++] = fp16_ieee_from_fp32_value((float)value);
+                //break;
+                //case VECTOR_TYPE_BF16:
+                //bfloat16_blob[count++] = float32_to_bfloat16((float)value);
+                //break;
             case VECTOR_TYPE_U8:
                 uint8_blob[count++] = (uint8_t)value;
                 break;
@@ -1314,11 +1125,11 @@ static void vector_convert_f32 (sqlite3_context *context, int argc, sqlite3_valu
 }
 
 static void vector_convert_f16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_F16, argc, argv);
+    //vector_convert(context, VECTOR_TYPE_F16, argc, argv);
 }
 
 static void vector_convert_bf16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_BF16, argc, argv);
+    //vector_convert(context, VECTOR_TYPE_BF16, argc, argv);
 }
 
 static void vector_convert_u8 (sqlite3_context *context, int argc, sqlite3_value **argv) {
@@ -1517,25 +1328,25 @@ static inline int vFullScanFindMaxIndex (double *values, int n) {
         for (int i = 1; i < n; ++i) {
             if (values[i] > values[max_idx]) {max_idx = i;}
         }
-    } else {
-        // use unrolled version
-        double max_val = values[0];
-        int i = 1;
-        
-        // unroll loop in blocks of 4
-        for (; i + 3 < n; i += 4) {
-            if (values[i] > max_val) {max_val = values[i]; max_idx = i;}
-            if (values[i + 1] > max_val) {max_val = values[i + 1]; max_idx = i + 1;}
-            if (values[i + 2] > max_val) {max_val = values[i + 2]; max_idx = i + 2;}
-            if (values[i + 3] > max_val) {max_val = values[i + 3]; max_idx = i + 3;}
-        }
-        
-        // process remaining elements
-        for (; i < n; ++i) {
-            if (values[i] > max_val) {max_val = values[i]; max_idx = i;}
-        }
+        return max_idx;
     }
     
+    // use unrolled version
+    double max_val = values[0];
+    int i = 1;
+    
+    // unroll loop in blocks of 4
+    for (; i + 3 < n; i += 4) {
+        if (values[i] > max_val) {max_val = values[i]; max_idx = i;}
+        if (values[i + 1] > max_val) {max_val = values[i + 1]; max_idx = i + 1;}
+        if (values[i + 2] > max_val) {max_val = values[i + 2]; max_idx = i + 2;}
+        if (values[i + 3] > max_val) {max_val = values[i + 3]; max_idx = i + 3;}
+    }
+    
+    // process remaining elements
+    for (; i < n; ++i) {
+        if (values[i] > max_val) {max_val = values[i]; max_idx = i;}
+    }
     return max_idx;
 }
 
@@ -1572,13 +1383,18 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
     int rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
+    // compute distance function
+    vector_distance vd = c->table->options.v_distance;
+    vector_type vt = c->table->options.v_type;
+    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    
     while (1) {
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; goto cleanup;}
         if (rc != SQLITE_ROW) goto cleanup;
         
         float *v2 = (float *)sqlite3_column_blob(vm, 1);
-        double distance = float32_distance_l2((float *)v1, (float *)v2, dimension, true);
+        double distance = distance_fn((const void *)v1, (const void *)v2, dimension);
         
         if (distance < c->distance[c->max_index]) {
             c->distance[c->max_index] = distance;
@@ -1610,12 +1426,17 @@ static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, int dim) {
     int64_t *rowids = c->rowids;
     int max_index = c->max_index;
     double current_max = distance[max_index];
-
+    
+    // compute distance function
+    vector_distance vd = c->table->options.v_distance;
+    vector_type vt = VECTOR_TYPE_U8;
+    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    
     for (int i = 0; i < counter; ++i) {
         const uint8_t *current_data = data + (i * total_stride);
         const uint8_t *vector_data = current_data + rowid_size;
 
-        uint32_t dist = distance_lut16x(v, vector_data, dim);
+        float dist = distance_fn((const void *)v, (const void *)vector_data, dim);
 
         if (dist < current_max) {
             distance[max_index] = dist;
@@ -1637,14 +1458,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     uint8_t *v = (uint8_t *)sqlite3_malloc(dimension * sizeof(int8_t));
     if (!v) return SQLITE_NOMEM;
     
-    float offset = c->table->offset;
-    float scale = c->table->scale;
-    float *target = (float *)v1;
-    for (int i=0; i<dimension; ++i) {
-        float scaled = (target[i] - offset) * scale;
-        v[i] = (uint8_t)fminf(255.0f, fmaxf(0.0f, roundf(scaled)));
-    }
-    
+    float32_quantize_u8((float *)v1, v, c->table->offset, c->table->scale, dimension);
     if (c->table->preloaded) return vQuantRunMemory(c, v, dimension);
     
     char sql[STATIC_SQL_SIZE];
@@ -1657,6 +1471,11 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     const size_t rowid_size = sizeof(int64_t);
     const size_t vector_size = dimension * sizeof(uint8_t);
     const size_t total_stride = rowid_size + vector_size;
+    
+    // compute distance function
+    vector_distance vd = c->table->options.v_distance;
+    vector_type vt = VECTOR_TYPE_U8;
+    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
     
     while (1) {
         rc = sqlite3_step(vm);
@@ -1672,7 +1491,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         for (int i=0; i<counter; ++i) {
             const uint8_t *current_data = data + (i * total_stride);
             const uint8_t *vector_data = current_data + rowid_size;
-            double distance = (double)distance_lut16x(v, vector_data, dimension);
+            double distance = (double)distance_fn((const void *)v, (const void *)vector_data, dimension);
             
             if (distance < current_max_distance) {
                 c->distance[c->max_index] = distance;
@@ -1811,11 +1630,17 @@ static void vector_init (sqlite3_context *context, int argc, sqlite3_value **arg
 static void vector_version (sqlite3_context *context, int argc, sqlite3_value **argv) {
     sqlite3_result_text(context, SQLITE_VECTOR_VERSION, -1, NULL);
 }
+
+static void vector_backend (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_result_text(context, distance_backend_name, -1, NULL);
+}
     
 // MARK: -
 
 SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
     int rc = SQLITE_OK;
+    
+    init_distance_functions();
     
     // init context
     void *ctx = vector_context_create();
@@ -1825,6 +1650,9 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     }
     
     rc = sqlite3_create_function(db, "vector_version", 0, SQLITE_UTF8, ctx, vector_version, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    rc = sqlite3_create_function(db, "vector_backend", 0, SQLITE_UTF8, ctx, vector_backend, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     // table_name, column_name, options
