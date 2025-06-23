@@ -155,8 +155,8 @@ static inline float uint8_distance_l2_impl_neon(const void *v1, const void *v2, 
         uint8x16_t vb = vld1q_u8(b + i);
 
         // compute 8-bit differences widened to signed 16-bit
-        int16x8_t diff_lo = vsubl_u8(vget_low_u8(va), vget_low_u8(vb));
-        int16x8_t diff_hi = vsubl_u8(vget_high_u8(va), vget_high_u8(vb));
+        uint16x8_t diff_lo = vsubl_u8(vget_low_u8(va), vget_low_u8(vb));
+        uint16x8_t diff_hi = vsubl_u8(vget_high_u8(va), vget_high_u8(vb));
 
         // widen to signed 32-bit and square
         int32x4_t diff_lo_0 = vmovl_s16(vget_low_s16(diff_lo));
