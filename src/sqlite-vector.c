@@ -9,6 +9,10 @@
 #include "sqlite-vector.h"
 #include "distance-cpu.h"
 
+#ifdef _WIN32
+#define _GNU_SOURCE
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <ctype.h>
