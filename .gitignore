@@ -1,1 +1,10 @@
 .DS_Store
+*.xcworkspacedata
+*.xcuserstate
+*.xcbkptlist
+*.plist
+/build
+/dist
+*.sqlite
+*.a
+.vscode
