@@ -24,6 +24,10 @@
 #include <float.h>
 #endif
 
+#ifndef SQLITE_CORE
+SQLITE_EXTENSION_INIT1
+#endif
+
 #define DEBUG_VECTOR_ALWAYS(...)                    do {printf(__VA_ARGS__ );printf("\n");} while (0)
 
 #if ENABLE_VECTOR_DEBUG
@@ -1758,6 +1762,9 @@ static void vector_backend (sqlite3_context *context, int argc, sqlite3_value **
 // MARK: -
 
 SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+    #ifndef SQLITE_CORE
+    SQLITE_EXTENSION_INIT2(pApi);
+    #endif
     int rc = SQLITE_OK;
     
     init_distance_functions(false);
