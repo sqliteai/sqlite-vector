@@ -21,28 +21,18 @@
 #include <stddef.h>
 
 #ifdef _WIN32
-char* strcasestr(const char* haystack, const char* needle) {
-    if (!haystack || !needle) {
-        return NULL;
-    }
-    
-    if (*needle == '\0') {
-        return (char*)haystack;
-    }
-    
-    size_t needle_len = strlen(needle);
-    size_t haystack_len = strlen(haystack);
-    
-    if (needle_len > haystack_len) {
-        return NULL;
-    }
-    
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (strnicmp(haystack + i, needle, needle_len) == 0) {
-            return (char*)(haystack + i);
+char *strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; ++haystack) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+            ++h;
+            ++n;
         }
+        if (!*n) return (char *)haystack;
     }
-    
     return NULL;
 }
 #endif
