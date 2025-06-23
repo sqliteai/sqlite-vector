@@ -9,10 +9,6 @@
 #include "sqlite-vector.h"
 #include "distance-cpu.h"
 
-#ifdef _WIN32
-#define _GNU_SOURCE
-#endif
-
 #include <math.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -23,6 +19,33 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+#ifdef _WIN32
+char* strcasestr(const char* haystack, const char* needle) {
+    if (!haystack || !needle) {
+        return NULL;
+    }
+    
+    if (*needle == '\0') {
+        return (char*)haystack;
+    }
+    
+    size_t needle_len = strlen(needle);
+    size_t haystack_len = strlen(haystack);
+    
+    if (needle_len > haystack_len) {
+        return NULL;
+    }
+    
+    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+        if (strnicmp(haystack + i, needle, needle_len) == 0) {
+            return (char*)(haystack + i);
+        }
+    }
+    
+    return NULL;
+}
+#endif
 
 #if defined(_WIN32) || defined(__linux__)
 #include <float.h>
