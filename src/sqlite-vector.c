@@ -225,73 +225,6 @@ static inline uint16_t float32_to_float16(float f) {
     return (uint16_t)(sign | h_exp | h_frac);
 }
 
-// MARK: - Quantization -
-
-static inline void quantize_float32_to_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        float s0 = (v[i]     - offset) * scale;
-        float s1 = (v[i + 1] - offset) * scale;
-        float s2 = (v[i + 2] - offset) * scale;
-        float s3 = (v[i + 3] - offset) * scale;
-
-        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
-        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
-        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
-        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
-
-        r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
-        r1 = r1 > 255 ? 255 : (r1 < 0 ? 0 : r1);
-        r2 = r2 > 255 ? 255 : (r2 < 0 ? 0 : r2);
-        r3 = r3 > 255 ? 255 : (r3 < 0 ? 0 : r3);
-
-        q[i]     = (uint8_t)r0;
-        q[i + 1] = (uint8_t)r1;
-        q[i + 2] = (uint8_t)r2;
-        q[i + 3] = (uint8_t)r3;
-    }
-
-    // Handle remaining elements
-    for (; i < n; ++i) {
-        float scaled = (v[i] - offset) * scale;
-        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
-        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);
-        q[i] = (uint8_t)rounded;
-    }
-}
-
-static inline void quantize_float16_to_u8 (const int16_t *v, uint8_t *q, float offset, float scale, int n) {
-    for (int i = 0; i < n; ++i) {
-        float x = (float16_to_float32((uint16_t)v[i]) - offset) * scale;
-        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));
-        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
-    }
-}
-
-static inline void quantize_bfloat16_to_u8(const int16_t *v, uint8_t *q, float offset, float scale, int n) {
-    for (int i = 0; i < n; ++i) {
-        float x = (bfloat16_to_float32(v[i]) - offset) * scale;
-        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));  // round to nearest
-        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));     // clamp to [0, 255]
-    }
-}
-
-static inline void quantize_u8_to_u8 (const uint8_t *v, uint8_t *q, float offset, float scale, int n) {
-    for (int i = 0; i < n; ++i) {
-        float x = ((float)v[i] - offset) * scale;
-        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));
-        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
-    }
-}
-
-static inline void quantize_i8_to_u8 (const int8_t *v, uint8_t *q, float offset, float scale, int n) {
-    for (int i = 0; i < n; ++i) {
-        float x = ((float)v[i] - offset) * scale;
-        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));
-        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
-    }
-}
-
 // MARK: - SQLite Utils -
 
 bool sqlite_system_exists (sqlite3 *db, const char *name, const char *type) {
@@ -493,13 +426,66 @@ static sqlite3_int64 sqlite_read_int64 (sqlite3 *db, const char *sql) {
     return value;
 }
 
+static void *sqlite_common_set_error (sqlite3_context *context, sqlite3_vtab *vtab, int rc, const char *format, ...) {
+    char buffer[4096];
+    char *err = NULL;
+    
+    va_list arg;
+    va_start (arg, format);
+    if (vtab) err = sqlite3_vmprintf(format, arg);
+    else if (context) vsnprintf(buffer, sizeof(buffer), format, arg);
+    va_end (arg);
+        
+    if (vtab) {
+        vtab->zErrMsg = err;
+    } else if (context) {
+        sqlite3_result_error(context, buffer, -1);
+        sqlite3_result_error_code(context, rc);
+    }
+    
+    return NULL;
+}
+
 // MARK: - General Utils -
+
+static inline void quantize_float32_to_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float s0 = (v[i]     - offset) * scale;
+        float s1 = (v[i + 1] - offset) * scale;
+        float s2 = (v[i + 2] - offset) * scale;
+        float s3 = (v[i + 3] - offset) * scale;
+
+        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
+        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
+        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
+        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
+
+        r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
+        r1 = r1 > 255 ? 255 : (r1 < 0 ? 0 : r1);
+        r2 = r2 > 255 ? 255 : (r2 < 0 ? 0 : r2);
+        r3 = r3 > 255 ? 255 : (r3 < 0 ? 0 : r3);
+
+        q[i]     = (uint8_t)r0;
+        q[i + 1] = (uint8_t)r1;
+        q[i + 2] = (uint8_t)r2;
+        q[i + 3] = (uint8_t)r3;
+    }
+
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        float scaled = (v[i] - offset) * scale;
+        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
+        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);
+        q[i] = (uint8_t)rounded;
+    }
+}
 
 static size_t vector_type_to_size (vector_type type) {
     switch (type) {
         case VECTOR_TYPE_F32: return sizeof(float);
         case VECTOR_TYPE_F16: return sizeof(uint16_t);
-        case VECTOR_TYPE_BF16: return sizeof(uint16_t/*bfloat16*/); // TODO: FIX ME
+        case VECTOR_TYPE_BF16: return sizeof(bfloat16_t);
         case VECTOR_TYPE_U8: return sizeof(uint8_t);
         case VECTOR_TYPE_I8: return sizeof(int8_t);
     }
@@ -824,7 +810,8 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     
     const char *pk_name = t_ctx->pk_name;
     int dim = t_ctx->options.v_dim;
-    //vector_type type = t_ctx->options.v_type;
+    vector_type type = t_ctx->options.v_type;
+    float *tempv = NULL;
     
     // compute size of a single quant, format is: rowid + quantize dimensions
     int q_size = sizeof(int64_t) + (dim * sizeof(uint8_t));
@@ -845,6 +832,9 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     uint8_t *original = data;
     if (!data) goto vector_rebuild_quantization_cleanup;
     
+    tempv = (float *)sqlite3_malloc(sizeof(float) * dim);
+    if (!tempv) goto vector_rebuild_quantization_cleanup;
+        
     // SELECT rowid, embedding FROM table
     generate_select_from_table(table_name, column_name, pk_name, sql);
     rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
@@ -860,14 +850,45 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
         else if (rc != SQLITE_ROW) break;
         
-        float *v = (float *)sqlite3_column_blob(vm, 1);
-        for (int i=0; i<dim; ++i) {
-            if (v[i] < min_val) min_val = v[i];
-            if (v[i] > max_val) max_val = v[i];
+        const void *blob = (float *)sqlite3_column_blob(vm, 1);
+        int blob_size = sqlite3_column_bytes(vm, 1);
+        if (!blob || blob_size < dim * vector_type_to_size(type)) {
+            context_result_error(context, SQLITE_ERROR, "Invalid or missing vector blob found at rowid %lld.", (long long)sqlite3_column_int64(vm, 0));
+            rc = SQLITE_ERROR;
+            goto vector_rebuild_quantization_cleanup;
+        }
+        
+        for (int i = 0; i < dim; ++i) {
+            float val = 0.0f;
+            switch (type) {
+                case VECTOR_TYPE_F32:
+                    val = ((float *)blob)[i];
+                    break;
+                case VECTOR_TYPE_F16:
+                    val = fp16_ieee_to_fp32_value(((uint16_t *)blob)[i]);
+                    break;
+                case VECTOR_TYPE_BF16:
+                    val = bfloat16_to_float32(((uint16_t *)blob)[i]);
+                    break;
+                case VECTOR_TYPE_U8:
+                    val = (float)(((uint8_t *)blob)[i]);
+                    break;
+                case VECTOR_TYPE_I8:
+                    val = (float)(((int8_t *)blob)[i]);
+                    break;
+                default:
+                    context_result_error(context, SQLITE_ERROR, "Unsupported vector type.");
+                    rc = SQLITE_ERROR;
+                    goto vector_rebuild_quantization_cleanup;
+            }
+            if (val < min_val) min_val = val;
+            if (val > max_val) max_val = val;
         }
     }
     
-    // calculate scale and offset and set table them to table context
+    // STEP 2
+    // compute scale and offset and set table them to table context
+    // standard min-max linear quantization
     float scale = 255.0f / (max_val - min_val);
     float offset = min_val;
     
@@ -878,7 +899,8 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     rc = sqlite3_reset(vm);
     if (rc != SQLITE_OK) goto vector_rebuild_quantization_cleanup;
     
-    // begin quantization (ONLY 8bit is supported in this version)
+    // STEP 3
+    // actual quantization (ONLY 8bit is supported in this version)
     uint32_t n_processed = 0;
     uint32_t tot_processed = 0;
     int64_t min_rowid = 0, max_rowid = 0;
@@ -888,8 +910,32 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         else if (rc != SQLITE_ROW) break;
         
         int64_t rowid = (int64_t)sqlite3_column_int64(vm, 0);
-        float *v = (float *)sqlite3_column_blob(vm, 1);
+        const void *blob = sqlite3_column_blob(vm, 1);
         if (n_processed == 0) min_rowid = rowid;
+        
+        float *v = tempv;
+        if (type == VECTOR_TYPE_F32) {
+            v = (float *)blob;
+        } else {
+            for (int i = 0; i < dim; ++i) {
+                switch (type) {
+                    case VECTOR_TYPE_F32:
+                        break;
+                    case VECTOR_TYPE_F16:
+                        v[i] = fp16_ieee_to_fp32_value(((uint16_t *)blob)[i]);
+                        break;
+                    case VECTOR_TYPE_BF16:
+                        v[i] = bfloat16_to_float32(((uint16_t *)blob)[i]);
+                        break;
+                    case VECTOR_TYPE_U8:
+                        v[i] = (float)(((uint8_t *)blob)[i]);
+                        break;
+                    case VECTOR_TYPE_I8:
+                        v[i] = (float)(((int8_t *)blob)[i]);
+                        break;
+                }
+            }
+        }
         
         // copy rowid
         INT64_TO_INT8PTR(rowid, data);
@@ -913,7 +959,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     }
     
     // handle remaining vectors
-    if (n_processed > 0) {
+    if (n_processed > 0 && rc == SQLITE_OK) {
         size_t batch_size = data - original;
         rc = vector_serialize_quantization(db, table_name, column_name, n_processed, original, batch_size, min_rowid, max_rowid);
     }
@@ -921,6 +967,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
 vector_rebuild_quantization_cleanup:
     if (rc != SQLITE_OK) printf("Error in vector_rebuild_quantization: %s\n", sqlite3_errmsg(db));
     if (original) sqlite3_free(original);
+    if (tempv) sqlite3_free(tempv);
     if (vm) sqlite3_finalize(vm);
     return rc;
 }
@@ -1097,7 +1144,7 @@ static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **
 
 // MARK: -
 
-static char *vector_convert_from_json (sqlite3_context *context, vector_type type, const char *json, int *size) {
+static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vector_type type, const char *json, int *size) {
     char *blob = NULL;
     
     // skip leading whitespace
@@ -1105,8 +1152,7 @@ static char *vector_convert_from_json (sqlite3_context *context, vector_type typ
     
     // sanity check the JSON start array character
     if (*json != '[') {
-        context_result_error(context, SQLITE_ERROR, "Malformed JSON: expected '[' at the beginning of the array.");
-        return NULL;
+        return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Malformed JSON: expected '[' at the beginning of the array.");
     }
     json++;
 
@@ -1122,15 +1168,15 @@ static char *vector_convert_from_json (sqlite3_context *context, vector_type typ
     size_t alloc = (estimated_count + 1) * item_size;
     blob = sqlite3_malloc((int)alloc);
     if (!blob) {
-        context_result_error(context, SQLITE_NOMEM, "Out of memory: unable to allocate %zu bytes for BLOB buffer.", alloc);
-        return NULL;
+        return sqlite_common_set_error(context, vtab, SQLITE_NOMEM, "Out of memory: unable to allocate %lld bytes for BLOB buffer.", (long long)alloc);
     }
     
-    float *float_blob = (float *)blob;
-    //uint16_t *uint16_blob = (uint16_t *)blob;
-    //bfloat16 *bfloat16_blob = (bfloat16 *)blob;
-    uint8_t *uint8_blob = (uint8_t *)blob;
-    int8_t *int8_blob = (int8_t *)blob;
+    // typed pointers
+    float      *float_blob    = (float *)blob;
+    uint8_t    *uint8_blob    = (uint8_t *)blob;
+    int8_t     *int8_blob     = (int8_t *)blob;
+    uint16_t   *uint16_blob   = (uint16_t *)blob;
+    bfloat16_t *bfloat16_blob = (bfloat16_t *)blob;
     
     int count = 0;
     const char *p = json;
@@ -1144,29 +1190,52 @@ static char *vector_convert_from_json (sqlite3_context *context, vector_type typ
         // parse number
         char *endptr;
         double value = strtod(p, &endptr);
+        
+        // sanity check
         if (p == endptr) {
             // parsing failed
-            context_result_error(context, SQLITE_ERROR, "Malformed JSON: expected a number at position %d (found '%c').", (int)(p - json) + 1, *p ? *p : '?');
             sqlite3_free(blob);
-            return NULL;
+            return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Malformed JSON: expected a number at position %d (found '%c').", (int)(p - json) + 1, *p ? *p : '?');
         }
         
+        if (count >= (int)(alloc / item_size)) {
+            sqlite3_free(blob);
+            return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Too many elements in JSON array.");
+        }
+        
+        // convert to proper type
         switch (type) {
             case VECTOR_TYPE_F32:
                 float_blob[count++] = (float)value;
                 break;
-                //case VECTOR_TYPE_F16:
-                //uint16_blob[count++] = fp16_ieee_from_fp32_value((float)value);
-                //break;
-                //case VECTOR_TYPE_BF16:
-                //bfloat16_blob[count++] = float32_to_bfloat16((float)value);
-                //break;
+                
+            case VECTOR_TYPE_F16:
+                uint16_blob[count++] = fp16_ieee_from_fp32_value((float)value);
+                break;
+
+            case VECTOR_TYPE_BF16:
+                bfloat16_blob[count++] = float32_to_bfloat16((float)value);
+                break;
+                
             case VECTOR_TYPE_U8:
+                if (value < 0 || value > 255) {
+                    sqlite3_free(blob);
+                    return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Value out of range for uint8_t.");
+                }
                 uint8_blob[count++] = (uint8_t)value;
                 break;
+                
             case VECTOR_TYPE_I8:
+                if (value < -128 || value > 127) {
+                    sqlite3_free(blob);
+                    return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Value out of range for int8_t.");
+                }
                 int8_blob[count++] = (int8_t)value;
                 break;
+                
+            default:
+                sqlite3_free(blob);
+                return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Unsupported vector type.");
         }
         
         p = endptr;
@@ -1187,10 +1256,8 @@ static char *vector_convert_from_json (sqlite3_context *context, vector_type typ
             //end-of-array
             break;
         } else {
-            // unexpected character
-            context_result_error(context, SQLITE_ERROR, "Malformed JSON: unexpected character '%c' at position %d.", *p ? *p : '?', (int)(p - json) + 1);
             sqlite3_free(blob);
-            return NULL;
+            return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Malformed JSON: unexpected character '%c' at position %d.", *p ? *p : '?', (int)(p - json) + 1);
         }
     }
     
@@ -1215,7 +1282,7 @@ static void vector_convert (sqlite3_context *context, vector_type type, int argc
     
     if (value_type == SQLITE_TEXT) {
         // try to parse JSON array value
-        char *blob = vector_convert_from_json(context, type, (const char *)sqlite3_value_text(value), &value_size);
+        char *blob = vector_convert_from_json(context, NULL, type, (const char *)sqlite3_value_text(value), &value_size);
         if (!blob) return; // error is set in the context
         
         sqlite3_result_blob(context, (const void *)blob, value_size, sqlite3_free);
@@ -1289,9 +1356,8 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     int vsize = 0;
     if (sqlite3_value_type(argv[2]) == SQLITE_TEXT) {
         vsize = sqlite3_value_bytes(argv[2]);
-        vector = (const void *)vector_convert_from_json(NULL, t_ctx->options.v_type, (const char *)sqlite3_value_text(argv[2]), &vsize);
-        // TODO: error here
-        if (!vector) return SQLITE_ERROR;
+        vector = (const void *)vector_convert_from_json(NULL, &vtab->base, t_ctx->options.v_type, (const char *)sqlite3_value_text(argv[2]), &vsize);
+        if (!vector) return SQLITE_ERROR; // error already set inside vector_convert_from_json
     } else {
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
