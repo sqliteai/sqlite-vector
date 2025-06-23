@@ -85,6 +85,7 @@ jobs:
           cat > commands.sh << EOF
             mv -f /data/local/tmp/sqlite3 /system/xbin
             cd /data/local/tmp
+            sqlite3 ":memory:" -cmd ".bail on" ".load ./dist/vector" "SELECT vector_version();"
             $(make test PLATFORM=$PLATFORM ARCH=$ARCH -n)
           EOF
           echo "::endgroup::"
