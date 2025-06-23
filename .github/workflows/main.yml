@@ -1,0 +1,171 @@
+name: build, test and release sqlite-vector
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }} build${{ matrix.arch != 'arm64-v8a' && matrix.name != 'isim' && matrix.name != 'ios' && ' + test' || ''}}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            name: linux
+          - os: LinuxARM64
+            arch: arm64
+            name: linux
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            arch: x86_64
+            name: windows
+          - os: ubuntu-latest
+            arch: arm64-v8a
+            name: android
+            make: PLATFORM=android ARCH=arm64-v8a
+          - os: ubuntu-latest
+            arch: x86_64
+            name: android
+            make: PLATFORM=android ARCH=x86_64
+            sqlite-amalgamation-zip: https://sqlite.org/2025/sqlite-amalgamation-3490100.zip
+          - os: macos-latest
+            name: ios
+            make: PLATFORM=ios
+          - os: macos-latest
+            name: isim
+            make: PLATFORM=isim
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+      - uses: actions/checkout@v4.2.2
+
+      - name: build sqlite-vector
+        run: make extension ${{ matrix.make && matrix.make || ''}}
+
+      - name: windows install sqlite3
+        if: matrix.os == 'windows-latest'
+        run: choco install sqlite -y
+
+      - name: macos install sqlite3 without SQLITE_OMIT_LOAD_EXTENSION
+        if: matrix.name == 'macos'
+        run: brew link sqlite --force
+
+      - name: android setup test environment
+        if: matrix.name == 'android' && matrix.arch != 'arm64-v8a'
+        run: |
+
+          echo "::group::enable kvm group perms"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          echo "::endgroup::"
+
+          echo "::group::download and build sqlite3 without SQLITE_OMIT_LOAD_EXTENSION"
+          curl -O ${{ matrix.sqlite-amalgamation-zip }}
+          unzip sqlite-amalgamation-*.zip
+          export ${{ matrix.make }}
+          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.arch }}-linux-android26-clang sqlite-amalgamation-*/shell.c sqlite-amalgamation-*/sqlite3.c -o sqlite3 -ldl
+          # remove unused folders to save up space
+          rm -rf sqlite-amalgamation-*.zip sqlite-amalgamation-* openssl
+          echo "::endgroup::"
+
+          echo "::group::prepare the test script"
+          make test PLATFORM=$PLATFORM ARCH=$ARCH || echo "It should fail. Running remaining commands in the emulator"
+          cat > commands.sh << EOF
+            mv -f /data/local/tmp/sqlite3 /system/xbin
+            cd /data/local/tmp
+            $(make test PLATFORM=$PLATFORM ARCH=$ARCH -n)
+          EOF
+          echo "::endgroup::"
+
+      - name: android test sqlite-vector
+        if: matrix.name == 'android' && matrix.arch != 'arm64-v8a'
+        uses: reactivecircus/android-emulator-runner@v2.34.0
+        with:
+          api-level: 26
+          arch: ${{ matrix.arch }}
+          script: |
+            adb root
+            adb remount
+            adb push ${{ github.workspace }}/. /data/local/tmp/
+            adb shell "sh /data/local/tmp/commands.sh"
+
+      - name: test sqlite-vector
+        if: matrix.name == 'linux' || matrix.name == 'windows' || matrix.name == 'macos'
+        run: make test
+
+      - uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: vector-${{ matrix.name }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }}
+          path: dist/vector.*
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    name: release
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/download-artifact@v4.2.1
+        with:
+          path: artifacts
+
+      - name: release tag version from sqlite-vector.h
+        id: tag
+        run: |
+          FILE="src/sqlite-vector.h"
+          VERSION=$(grep -oP '#define SQLITE_VECTOR_VERSION\s+"\K[^"]+' "$FILE")
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            LATEST=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.name')
+            if [[ "$VERSION" != "$LATEST" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
+            else
+              echo "::warning file=src/sqlite-vector.h::To release a new version, please update the SQLITE_VECTOR_VERSION in src/sqlite-vector.h to be different than the latest $LATEST"
+            fi
+            exit 0
+          fi
+          echo "❌ SQLITE_VECTOR_VERSION not found in sqlite-vector.h"
+          exit 1
+          
+      - name: zip artifacts
+        run: |
+          for folder in "artifacts"/*; do
+            if [ -d "$folder" ]; then
+              name=$(basename "$folder")
+              if [[ "$name" != "github-pages" ]]; then
+                zip -jq "${name}-${{ steps.tag.outputs.version }}.zip" "$folder"/*
+                tar -cJf "${name}-${{ steps.tag.outputs.version }}.tar.xz" -C "$folder" .
+                tar -czf "${name}-${{ steps.tag.outputs.version }}.tar.gz" -C "$folder" .
+              fi
+            fi
+          done
+
+      - uses: softprops/action-gh-release@v2.2.1
+        if: steps.tag.outputs.version != ''
+        with:
+          generate_release_notes: true
+          tag_name: ${{ steps.tag.outputs.version }}
+          files: |
+            vector-*-${{ steps.tag.outputs.version }}.zip
+            vector-*-${{ steps.tag.outputs.version }}.tar.xz
+            vector-*-${{ steps.tag.outputs.version }}.tar.gz
+          make_latest: true
