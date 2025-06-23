@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4.2.2
 
       - name: build sqlite-vector
-        run: make ${{ matrix.make && matrix.make || ''}}
+        run: make extension ${{ matrix.make && matrix.make || ''}}
 
       - name: windows install sqlite3
         if: matrix.os == 'windows-latest'
