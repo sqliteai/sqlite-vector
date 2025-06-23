@@ -143,45 +143,49 @@ float float32_distance_l1_neon (const void *v1, const void *v2, int n) {
 
 // MARK: - UINT8 -
 
-float uint8_distance_l2_impl_neon (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float uint8_distance_l2_impl_neon(const void *v1, const void *v2, int n, bool use_sqrt) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
-    
-    uint32x4_t acc = vmovq_n_u32(0);  // Accumulator for 4 lanes of 32-bit sums
+
+    uint32x4_t acc = vmovq_n_u32(0);
     int i = 0;
-    
-    // process 16 bytes per iteration
+
     for (; i <= n - 16; i += 16) {
         uint8x16_t va = vld1q_u8(a + i);
         uint8x16_t vb = vld1q_u8(b + i);
-        
-        // Convert to signed 16-bit integers to handle subtraction
-        uint16x8_t va_lo = vmovl_u8(vget_low_u8(va));   // Lower 8 bytes
-        uint16x8_t vb_lo = vmovl_u8(vget_low_u8(vb));
-        uint16x8_t va_hi = vmovl_u8(vget_high_u8(va));  // Upper 8 bytes
-        uint16x8_t vb_hi = vmovl_u8(vget_high_u8(vb));
-        
-        int16x8_t diff_lo = vreinterpretq_s16_u16(va_lo) - vreinterpretq_s16_u16(vb_lo);
-        int16x8_t diff_hi = vreinterpretq_s16_u16(va_hi) - vreinterpretq_s16_u16(vb_hi);
-        
-        int16x8_t sq_lo = vmulq_s16(diff_lo, diff_lo);
-        int16x8_t sq_hi = vmulq_s16(diff_hi, diff_hi);
-        
-        // Accumulate into 32-bit lanes
-        acc = vaddq_u32(acc, vpaddlq_u16(vpaddlq_s16(sq_lo)));
-        acc = vaddq_u32(acc, vpaddlq_u16(vpaddlq_s16(sq_hi)));
+
+        // compute 8-bit differences widened to signed 16-bit
+        int16x8_t diff_lo = vsubl_u8(vget_low_u8(va), vget_low_u8(vb));
+        int16x8_t diff_hi = vsubl_u8(vget_high_u8(va), vget_high_u8(vb));
+
+        // widen to signed 32-bit and square
+        int32x4_t diff_lo_0 = vmovl_s16(vget_low_s16(diff_lo));
+        int32x4_t diff_lo_1 = vmovl_s16(vget_high_s16(diff_lo));
+        int32x4_t diff_hi_0 = vmovl_s16(vget_low_s16(diff_hi));
+        int32x4_t diff_hi_1 = vmovl_s16(vget_high_s16(diff_hi));
+
+        diff_lo_0 = vmulq_s32(diff_lo_0, diff_lo_0);
+        diff_lo_1 = vmulq_s32(diff_lo_1, diff_lo_1);
+        diff_hi_0 = vmulq_s32(diff_hi_0, diff_hi_0);
+        diff_hi_1 = vmulq_s32(diff_hi_1, diff_hi_1);
+
+        // accumulate into uint32_t accumulator
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_lo_0));
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_lo_1));
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_hi_0));
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_hi_1));
     }
-    
-    // horizontal add of the 4 lanes
-    uint64x2_t pairwise_sum = vpaddlq_u32(acc);
-    uint64_t final_sum = vgetq_lane_u64(pairwise_sum, 0) + vgetq_lane_u64(pairwise_sum, 1);
-    
-    // tail loop for remaining elements
+
+    // horizontal sum
+    uint64x2_t sum64 = vpaddlq_u32(acc);
+    uint64_t final_sum = vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
+
+    // tail
     for (; i < n; ++i) {
         int diff = (int)a[i] - (int)b[i];
-        final_sum += diff * diff;
+        final_sum += (uint64_t)(diff * diff);
     }
-    
+
     return use_sqrt ? sqrtf((float)final_sum) : (float)final_sum;
 }
 
@@ -355,41 +359,50 @@ float uint8_distance_l1_neon (const void *v1, const void *v2, int n) {
 
 // MARK: - INT8 -
 
-float int8_distance_l2_neon_imp (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float int8_distance_l2_neon_imp (const void *v1, const void *v2, int n, bool use_sqrt) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
-    int32x4_t acc = vdupq_n_s32(0);
+
+    uint32x4_t acc = vmovq_n_u32(0);
     int i = 0;
 
     for (; i <= n - 16; i += 16) {
         int8x16_t va = vld1q_s8(a + i);
         int8x16_t vb = vld1q_s8(b + i);
-        int8x16_t diff = vsubq_s8(va, vb);
 
-        int16x8_t diff_lo = vmovl_s8(vget_low_s8(diff));
-        int16x8_t diff_hi = vmovl_s8(vget_high_s8(diff));
+        // signed widening subtraction: int8 → int16
+        int16x8_t diff_lo = vsubl_s8(vget_low_s8(va), vget_low_s8(vb));
+        int16x8_t diff_hi = vsubl_s8(vget_high_s8(va), vget_high_s8(vb));
 
-        int32x4_t sq_lo = vmull_s16(vget_low_s16(diff_lo), vget_low_s16(diff_lo));
-        int32x4_t sq_hi = vmull_s16(vget_high_s16(diff_lo), vget_high_s16(diff_lo));
-        int32x4_t sq_lo2 = vmull_s16(vget_low_s16(diff_hi), vget_low_s16(diff_hi));
-        int32x4_t sq_hi2 = vmull_s16(vget_high_s16(diff_hi), vget_high_s16(diff_hi));
+        // widen to int32 and square
+        int32x4_t diff_lo_0 = vmovl_s16(vget_low_s16(diff_lo));
+        int32x4_t diff_lo_1 = vmovl_s16(vget_high_s16(diff_lo));
+        int32x4_t diff_hi_0 = vmovl_s16(vget_low_s16(diff_hi));
+        int32x4_t diff_hi_1 = vmovl_s16(vget_high_s16(diff_hi));
 
-        acc = vaddq_s32(acc, sq_lo);
-        acc = vaddq_s32(acc, sq_hi);
-        acc = vaddq_s32(acc, sq_lo2);
-        acc = vaddq_s32(acc, sq_hi2);
+        diff_lo_0 = vmulq_s32(diff_lo_0, diff_lo_0);
+        diff_lo_1 = vmulq_s32(diff_lo_1, diff_lo_1);
+        diff_hi_0 = vmulq_s32(diff_hi_0, diff_hi_0);
+        diff_hi_1 = vmulq_s32(diff_hi_1, diff_hi_1);
+
+        // accumulate, cast to uint32 to match accumulator type
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_lo_0));
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_lo_1));
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_hi_0));
+        acc = vaddq_u32(acc, vreinterpretq_u32_s32(diff_hi_1));
     }
 
-    int32_t sum = vgetq_lane_s32(acc, 0) + vgetq_lane_s32(acc, 1)
-                + vgetq_lane_s32(acc, 2) + vgetq_lane_s32(acc, 3);
+    // horizontal sum
+    uint64x2_t sum64 = vpaddlq_u32(acc);
+    uint64_t final_sum = vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
 
+    // tail
     for (; i < n; ++i) {
-        int d = (int)a[i] - (int)b[i];
-        sum += d * d;
+        int diff = (int)a[i] - (int)b[i];
+        final_sum += (uint64_t)(diff * diff);
     }
 
-    return use_sqrt ? sqrtf(sum) : sum;
+    return use_sqrt ? sqrtf((float)final_sum) : (float)final_sum;
 }
 
 float int8_distance_l2_neon (const void *v1, const void *v2, int n) {
@@ -508,39 +521,42 @@ float int8_distance_dot_neon (const void *v1, const void *v2, int n) {
     return -(float)dot;  // negative dot product
 }
 
-float int8_distance_l1_neon (const void *v1, const void *v2, int n) {
+float int8_distance_l1_neon(const void *v1, const void *v2, int n) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
-    uint16x8_t acc_lo = vdupq_n_u16(0);
-    uint16x8_t acc_hi = vdupq_n_u16(0);
+
+    uint32x4_t acc = vdupq_n_u32(0);
     int i = 0;
 
     for (; i <= n - 16; i += 16) {
         int8x16_t va = vld1q_s8(a + i);
         int8x16_t vb = vld1q_s8(b + i);
-        int8x16_t diff = vsubq_s8(va, vb);
-        int8x16_t abs_diff = vabsq_s8(diff);
 
-        uint8x16_t uabs = vreinterpretq_u8_s8(abs_diff);
-        uint16x8_t lo = vmovl_u8(vget_low_u8(uabs));
-        uint16x8_t hi = vmovl_u8(vget_high_u8(uabs));
+        // Widen to 16-bit signed
+        int16x8_t diff_lo = vsubl_s8(vget_low_s8(va), vget_low_s8(vb));
+        int16x8_t diff_hi = vsubl_s8(vget_high_s8(va), vget_high_s8(vb));
 
-        acc_lo = vaddq_u16(acc_lo, lo);
-        acc_hi = vaddq_u16(acc_hi, hi);
+        // Absolute values (safe for -128)
+        int16x8_t abs_lo = vabsq_s16(diff_lo);
+        int16x8_t abs_hi = vabsq_s16(diff_hi);
+
+        // Widen to 32-bit and accumulate
+        acc = vaddq_u32(acc, vmovl_u16(vget_low_u16(vreinterpretq_u16_s16(abs_lo))));
+        acc = vaddq_u32(acc, vmovl_u16(vget_high_u16(vreinterpretq_u16_s16(abs_lo))));
+        acc = vaddq_u32(acc, vmovl_u16(vget_low_u16(vreinterpretq_u16_s16(abs_hi))));
+        acc = vaddq_u32(acc, vmovl_u16(vget_high_u16(vreinterpretq_u16_s16(abs_hi))));
     }
 
-    uint16x8_t acc_total = vaddq_u16(acc_lo, acc_hi);
-    uint16_t tmp[8];
-    vst1q_u16(tmp, acc_total);
-    uint32_t total = tmp[0] + tmp[1] + tmp[2] + tmp[3]
-                   + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    // Horizontal sum
+    uint64x2_t sum64 = vpaddlq_u32(acc);
+    uint64_t final = vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
 
+    // Tail loop
     for (; i < n; ++i) {
-        total += (uint32_t)abs((int)a[i] - (int)b[i]);
+        final += (uint32_t)abs((int)a[i] - (int)b[i]);
     }
 
-    return (float)total;
+    return (float)final;
 }
 #endif
 

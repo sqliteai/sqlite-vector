@@ -9,6 +9,7 @@
 #define __VECTOR_DISTANCE_CPU__
 
 #include <inttypes.h>
+#include <stdbool.h>
 
 typedef enum {
     VECTOR_TYPE_F32 = 1,
@@ -35,6 +36,6 @@ typedef enum {
 typedef float (*distance_function_t)(const void *v1, const void *v2, int n);
 
 // ENTRYPOINT
-void init_distance_functions (void);
+void init_distance_functions (bool force_cpu);
 
 #endif

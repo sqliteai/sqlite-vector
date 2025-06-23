@@ -13,23 +13,12 @@
 #include <string.h>
 #include <math.h>
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include "distance-neon.h"
-#define USE_ARM_NEON                                1
-#endif
-
-#if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (_M_IX86_FP >= 2)))
 #include "distance-sse2.h"
-#define USE_INTEL_SEE2                              1
-#endif
-
-#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
 #include "distance-avx2.h"
-#define USE_INTEL_AVX2                              1
-#undef  USE_INTEL_SEE2
-#endif
 
 char *distance_backend_name = "CPU";
+distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX] = {0};
 
 // MARK: - FLOAT32 -
 
@@ -129,7 +118,7 @@ float float32_distance_dot_cpu (const void *v1, const void *v2, int n) {
         dot += x * y;
     }
     
-    return 1.0f - dot;
+    return -dot;
 }
 
 float float32_distance_l1_cpu (const void *v1, const void *v2, int n) {
@@ -157,7 +146,7 @@ float float32_distance_l1_cpu (const void *v1, const void *v2, int n) {
 
 // MARK: - UINT8 -
 
-inline float uint8_distance_l2_imp_cpu (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float uint8_distance_l2_imp_cpu (const void *v1, const void *v2, int n, bool use_sqrt) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
     
@@ -395,11 +384,15 @@ float int8_distance_l1_cpu (const void *v1, const void *v2, int n) {
     }
 
     bool cpu_supports_avx2 (void) {
+        #if FORCE_AVX2
+        return true;
+        #else
         int eax, ebx, ecx, edx;
         x86_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
         if (eax < 7) return false;
         x86_cpuid(7, 0, &eax, &ebx, &ecx, &edx);
         return (ebx & (1 << 5)) != 0;  // AVX2
+        #endif
     }
 
     bool cpu_supports_sse2 (void) {
@@ -429,51 +422,62 @@ float int8_distance_l1_cpu (const void *v1, const void *v2, int n) {
 
 // MARK: -
 
-void init_distance_functions (void) {
-    static bool table_inited = false;
-    if (table_inited) return;
-    table_inited = true;
+void init_cpu_functions (void) {
+    distance_function_t cpu_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX] = {
+        [VECTOR_DISTANCE_L2] = {
+                [VECTOR_TYPE_F32] = float32_distance_l2_cpu,
+                [VECTOR_TYPE_F16] = NULL,
+                [VECTOR_TYPE_BF16] = NULL,
+                [VECTOR_TYPE_U8]  = uint8_distance_l2_cpu,
+                [VECTOR_TYPE_I8]  = int8_distance_l2_cpu,
+            },
+            [VECTOR_DISTANCE_SQUARED_L2] = {
+                [VECTOR_TYPE_F32] = float32_distance_l2_squared_cpu,
+                [VECTOR_TYPE_F16] = NULL,
+                [VECTOR_TYPE_BF16] = NULL,
+                [VECTOR_TYPE_U8]  = uint8_distance_l2_squared_cpu,
+                [VECTOR_TYPE_I8]  = int8_distance_l2_squared_cpu,
+            },
+            [VECTOR_DISTANCE_COSINE] = {
+                [VECTOR_TYPE_F32] = float32_distance_cosine_cpu,
+                [VECTOR_TYPE_F16] = NULL,
+                [VECTOR_TYPE_BF16] = NULL,
+                [VECTOR_TYPE_U8]  = uint8_distance_cosine_cpu,
+                [VECTOR_TYPE_I8]  = int8_distance_cosine_cpu,
+            },
+            [VECTOR_DISTANCE_DOT] = {
+                [VECTOR_TYPE_F32] = float32_distance_dot_cpu,
+                [VECTOR_TYPE_F16] = NULL,
+                [VECTOR_TYPE_BF16] = NULL,
+                [VECTOR_TYPE_U8]  = uint8_distance_dot_cpu,
+                [VECTOR_TYPE_I8]  = int8_distance_dot_cpu,
+            },
+            [VECTOR_DISTANCE_L1] = {
+                [VECTOR_TYPE_F32] = float32_distance_l1_cpu,
+                [VECTOR_TYPE_F16] = NULL,
+                [VECTOR_TYPE_BF16] = NULL,
+                [VECTOR_TYPE_U8]  = uint8_distance_l1_cpu,
+                [VECTOR_TYPE_I8]  = int8_distance_l1_cpu,
+            }
+    };
     
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    if (cpu_supports_avx2()) {
+    memcpy(dispatch_distance_table, cpu_table, sizeof(cpu_table));
+}
+
+void init_distance_functions (bool force_cpu) {
+    init_cpu_functions();
+    if (force_cpu) return;
+    
+    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    if (1/*cpu_supports_avx2()*/) {
         init_distance_functions_avx2();
     } else if (cpu_supports_sse2()) {
         init_distance_functions_sse2();
     }
-#elif defined(__ARM_NEON) || defined(__aarch64__)
+    #elif defined(__ARM_NEON) || defined(__aarch64__)
     if (cpu_supports_neon()) {
         init_distance_functions_neon();
     }
-#else
-    // DO NOTHING
-#endif
+    #endif
 }
-
-distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX] = {
-    [VECTOR_DISTANCE_L2] = {
-            [VECTOR_TYPE_F32] = float32_distance_l2_cpu,
-            [VECTOR_TYPE_U8]  = uint8_distance_l2_cpu,
-            [VECTOR_TYPE_I8]  = int8_distance_l2_cpu,
-        },
-        [VECTOR_DISTANCE_SQUARED_L2] = {
-            [VECTOR_TYPE_F32] = float32_distance_l2_squared_cpu,
-            [VECTOR_TYPE_U8]  = uint8_distance_l2_squared_cpu,
-            [VECTOR_TYPE_I8]  = int8_distance_l2_squared_cpu,
-        },
-        [VECTOR_DISTANCE_COSINE] = {
-            [VECTOR_TYPE_F32] = float32_distance_cosine_cpu,
-            [VECTOR_TYPE_U8]  = uint8_distance_cosine_cpu,
-            [VECTOR_TYPE_I8]  = int8_distance_cosine_cpu,
-        },
-        [VECTOR_DISTANCE_DOT] = {
-            [VECTOR_TYPE_F32] = float32_distance_dot_cpu,
-            [VECTOR_TYPE_U8]  = uint8_distance_dot_cpu,
-            [VECTOR_TYPE_I8]  = int8_distance_dot_cpu,
-        },
-        [VECTOR_DISTANCE_L1] = {
-            [VECTOR_TYPE_F32] = float32_distance_l1_cpu,
-            [VECTOR_TYPE_U8]  = uint8_distance_l1_cpu,
-            [VECTOR_TYPE_I8]  = int8_distance_l1_cpu,
-        }
-};
 

@@ -1,11 +1,12 @@
 //
 //  distance-avx2.c
-//  sqlitevector_test
+//  sqlitevector
 //
 //  Created by Marco Bambini on 20/06/25.
 //
 
 #include "distance-avx2.h"
+#include "distance-cpu.h"
 
 #if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
 #include <immintrin.h>
@@ -19,7 +20,7 @@ extern char *distance_backend_name;
 
 // MARK: - FLOAT32 -
 
-float float32_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float float32_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
     
@@ -47,11 +48,11 @@ float float32_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool
 }
 
 float float32_distance_l2_avx2 (const void *v1, const void *v2, int n) {
-    return float_distance_l2_impl_avx2(v1, v2, n, true);
+    return float32_distance_l2_impl_avx2(v1, v2, n, true);
 }
 
 float float32_distance_l2_squared_avx2 (const void *v1, const void *v2, int n) {
-    return float_distance_l2_impl_avx2(v1, v2, n, false);
+    return float32_distance_l2_impl_avx2(v1, v2, n, false);
 }
 
 float float32_distance_l1_avx2 (const void *v1, const void *v2, int n) {
@@ -102,13 +103,13 @@ float float32_distance_dot_avx2 (const void *v1, const void *v2, int n) {
         total += a[i] * b[i];
     }
 
-    return total;
+    return -total;
 }
 
 float float32_distance_cosine_avx2 (const void *a, const void *b, int n) {
-    float dot = float32_distance_dot_avx2(a, b, n);
-    float norm_a = sqrtf(float32_distance_dot_avx2(a, a, n));
-    float norm_b = sqrtf(float32_distance_dot_avx2(b, b, n));
+    float dot = -float32_distance_dot_avx2(a, b, n);
+    float norm_a = sqrtf(-float32_distance_dot_avx2(a, a, n));
+    float norm_b = sqrtf(-float32_distance_dot_avx2(b, b, n));
 
     if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
 
@@ -116,10 +117,9 @@ float float32_distance_cosine_avx2 (const void *a, const void *b, int n) {
     return 1.0f - cosine_similarity;
 }
 
-
 // MARK: - UINT8 -
 
-float uint8_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float uint8_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
     
@@ -232,7 +232,7 @@ float uint8_distance_dot_avx2 (const void *v1, const void *v2, int n) {
         total += a[i] * b[i];
     }
 
-    return (float)total;
+    return -(float)total;
 }
 
 float uint8_distance_l1_avx2 (const void *v1, const void *v2, int n) {
@@ -278,9 +278,9 @@ float uint8_distance_l1_avx2 (const void *v1, const void *v2, int n) {
 }
 
 float uint8_distance_cosine_avx2 (const void *a, const void *b, int n) {
-    float dot = uint8_distance_dot_avx2(a, b, n);
-    float norm_a = sqrtf(uint8_distance_dot_avx2(a, a, n));
-    float norm_b = sqrtf(uint8_distance_dot_avx2(b, b, n));
+    float dot = -uint8_distance_dot_avx2(a, b, n);
+    float norm_a = sqrtf(-uint8_distance_dot_avx2(a, a, n));
+    float norm_b = sqrtf(-uint8_distance_dot_avx2(b, b, n));
 
     if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
 
@@ -290,7 +290,7 @@ float uint8_distance_cosine_avx2 (const void *a, const void *b, int n) {
 
 // MARK: - INT8 -
 
-float int8_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float int8_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
     
@@ -417,7 +417,7 @@ float int8_distance_dot_avx2 (const void *v1, const void *v2, int n) {
         total += (int)a[i] * (int)b[i];
     }
 
-    return (float)total;
+    return -(float)total;
 }
 
 float int8_distance_l1_avx2 (const void *v1, const void *v2, int n) {
@@ -475,9 +475,9 @@ float int8_distance_l1_avx2 (const void *v1, const void *v2, int n) {
 }
 
 float int8_distance_cosine_avx2 (const void *a, const void *b, int n) {
-    float dot = int8_distance_dot_avx2(a, b, n);
-    float norm_a = sqrtf(int8_distance_dot_avx2(a, a, n));
-    float norm_b = sqrtf(int8_distance_dot_avx2(b, b, n));
+    float dot = -int8_distance_dot_avx2(a, b, n);
+    float norm_a = sqrtf(-int8_distance_dot_avx2(a, a, n));
+    float norm_b = sqrtf(-int8_distance_dot_avx2(b, b, n));
 
     if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
 

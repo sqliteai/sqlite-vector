@@ -1,11 +1,12 @@
 //
 //  distance-sse2.c
-//  sqlitevector_test
+//  sqlitevector
 //
 //  Created by Marco Bambini on 20/06/25.
 //
 
 #include "distance-sse2.h"
+#include "distance-cpu.h"
 
 #if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (_M_IX86_FP >= 2)))
 #include <emmintrin.h>
@@ -22,9 +23,16 @@ extern char *distance_backend_name;
     acc_tmp = _mm_unpackhi_epi16(MUL, _mm_setzero_si128()); \
     ACC = _mm_add_epi32(ACC, acc_tmp);
 
+// proper sign-extension from int16_t to int32_t
+#define SIGN_EXTEND_EPI16_TO_EPI32_LO(v) \
+    _mm_srai_epi32(_mm_unpacklo_epi16(_mm_slli_epi32((v), 16), (v)), 16)
+
+#define SIGN_EXTEND_EPI16_TO_EPI32_HI(v) \
+    _mm_srai_epi32(_mm_unpackhi_epi16(_mm_slli_epi32((v), 16), (v)), 16)
+
 // MARK: - FLOAT32 -
 
-float float32_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float float32_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
     
@@ -107,7 +115,7 @@ float float32_distance_dot_sse2 (const void *v1, const void *v2, int n) {
         total += a[i] * b[i];
     }
 
-    return total;
+    return -total;
 }
 
 float float32_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
@@ -152,7 +160,7 @@ float float32_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
 
 // MARK: - UINT8 -
 
-float uint8_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float uint8_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
     
@@ -252,7 +260,7 @@ float uint8_distance_dot_sse2 (const void *v1, const void *v2, int n) {
         total += (int)a[i] * (int)b[i];
     }
 
-    return (float)total;
+    return -(float)total;
 }
 
 float uint8_distance_l1_sse2 (const void *v1, const void *v2, int n) {
@@ -377,7 +385,7 @@ float uint8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
 // Unpack to 16-bit signed integers
 // Multiply using _mm_mullo_epi16, and accumulate in 32-bit lanes
 
-float int8_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+static inline float int8_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
     
@@ -432,7 +440,7 @@ float int8_distance_l2_squared_sse2 (const void *v1, const void *v2, int n) {
 float int8_distance_dot_sse2 (const void *v1, const void *v2, int n) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
+
     __m128i acc = _mm_setzero_si128();
     int i = 0;
 
@@ -440,18 +448,25 @@ float int8_distance_dot_sse2 (const void *v1, const void *v2, int n) {
         __m128i va = _mm_loadu_si128((const __m128i *)(a + i));
         __m128i vb = _mm_loadu_si128((const __m128i *)(b + i));
 
-        __m128i va_lo = _mm_unpacklo_epi8(va, _mm_cmpgt_epi8(_mm_setzero_si128(), va));
-        __m128i vb_lo = _mm_unpacklo_epi8(vb, _mm_cmpgt_epi8(_mm_setzero_si128(), vb));
-        __m128i va_hi = _mm_unpackhi_epi8(va, _mm_cmpgt_epi8(_mm_setzero_si128(), va));
-        __m128i vb_hi = _mm_unpackhi_epi8(vb, _mm_cmpgt_epi8(_mm_setzero_si128(), vb));
+        // Manual sign-extension: int8_t → int16_t
+        __m128i zero = _mm_setzero_si128();
+        __m128i va_sign = _mm_cmpgt_epi8(zero, va);
+        __m128i vb_sign = _mm_cmpgt_epi8(zero, vb);
 
+        __m128i va_lo = _mm_unpacklo_epi8(va, va_sign);
+        __m128i va_hi = _mm_unpackhi_epi8(va, va_sign);
+        __m128i vb_lo = _mm_unpacklo_epi8(vb, vb_sign);
+        __m128i vb_hi = _mm_unpackhi_epi8(vb, vb_sign);
+
+        // Multiply int16 × int16 → int16 (overflow-safe because dot products are small)
         __m128i mul_lo = _mm_mullo_epi16(va_lo, vb_lo);
         __m128i mul_hi = _mm_mullo_epi16(va_hi, vb_hi);
 
-        acc = _mm_add_epi32(acc, _mm_unpacklo_epi16(mul_lo, _mm_setzero_si128()));
-        acc = _mm_add_epi32(acc, _mm_unpackhi_epi16(mul_lo, _mm_setzero_si128()));
-        acc = _mm_add_epi32(acc, _mm_unpacklo_epi16(mul_hi, _mm_setzero_si128()));
-        acc = _mm_add_epi32(acc, _mm_unpackhi_epi16(mul_hi, _mm_setzero_si128()));
+        // Correct signed extension: int16 → int32
+        acc = _mm_add_epi32(acc, SIGN_EXTEND_EPI16_TO_EPI32_LO(mul_lo));
+        acc = _mm_add_epi32(acc, SIGN_EXTEND_EPI16_TO_EPI32_HI(mul_lo));
+        acc = _mm_add_epi32(acc, SIGN_EXTEND_EPI16_TO_EPI32_LO(mul_hi));
+        acc = _mm_add_epi32(acc, SIGN_EXTEND_EPI16_TO_EPI32_HI(mul_hi));
     }
 
     int32_t partial[4];
@@ -462,7 +477,7 @@ float int8_distance_dot_sse2 (const void *v1, const void *v2, int n) {
         total += (int)a[i] * (int)b[i];
     }
 
-    return (float)total;
+    return -(float)total;
 }
 
 float int8_distance_l1_sse2 (const void *v1, const void *v2, int n) {
@@ -507,26 +522,30 @@ float int8_distance_l1_sse2 (const void *v1, const void *v2, int n) {
     return (float)total;
 }
 
-#include <math.h>
-
 float int8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
+
     __m128i acc_dot = _mm_setzero_si128();
     __m128i acc_a2  = _mm_setzero_si128();
     __m128i acc_b2  = _mm_setzero_si128();
-    int i = 0;
 
+    int i = 0;
     for (; i <= n - 16; i += 16) {
         __m128i va = _mm_loadu_si128((const __m128i *)(a + i));
         __m128i vb = _mm_loadu_si128((const __m128i *)(b + i));
 
-        __m128i va_lo = _mm_unpacklo_epi8(va, _mm_cmpgt_epi8(_mm_setzero_si128(), va));
-        __m128i vb_lo = _mm_unpacklo_epi8(vb, _mm_cmpgt_epi8(_mm_setzero_si128(), vb));
-        __m128i va_hi = _mm_unpackhi_epi8(va, _mm_cmpgt_epi8(_mm_setzero_si128(), va));
-        __m128i vb_hi = _mm_unpackhi_epi8(vb, _mm_cmpgt_epi8(_mm_setzero_si128(), vb));
+        // Manual sign extension from int8_t → int16_t
+        __m128i zero = _mm_setzero_si128();
+        __m128i va_sign = _mm_cmpgt_epi8(zero, va);
+        __m128i vb_sign = _mm_cmpgt_epi8(zero, vb);
 
+        __m128i va_lo = _mm_unpacklo_epi8(va, va_sign);  // lower 8 int8_t → int16_t
+        __m128i va_hi = _mm_unpackhi_epi8(va, va_sign);  // upper 8 int8_t → int16_t
+        __m128i vb_lo = _mm_unpacklo_epi8(vb, vb_sign);
+        __m128i vb_hi = _mm_unpackhi_epi8(vb, vb_sign);
+
+        // Multiply and accumulate
         __m128i dot_lo = _mm_mullo_epi16(va_lo, vb_lo);
         __m128i dot_hi = _mm_mullo_epi16(va_hi, vb_hi);
         __m128i a2_lo  = _mm_mullo_epi16(va_lo, va_lo);
@@ -534,31 +553,34 @@ float int8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
         __m128i b2_lo  = _mm_mullo_epi16(vb_lo, vb_lo);
         __m128i b2_hi  = _mm_mullo_epi16(vb_hi, vb_hi);
 
-        acc_dot = _mm_add_epi32(acc_dot, _mm_unpacklo_epi16(dot_lo, _mm_setzero_si128()));
-        acc_dot = _mm_add_epi32(acc_dot, _mm_unpackhi_epi16(dot_lo, _mm_setzero_si128()));
-        acc_dot = _mm_add_epi32(acc_dot, _mm_unpacklo_epi16(dot_hi, _mm_setzero_si128()));
-        acc_dot = _mm_add_epi32(acc_dot, _mm_unpackhi_epi16(dot_hi, _mm_setzero_si128()));
+        // Unpack 16-bit to 32-bit and accumulate
+        acc_dot = _mm_add_epi32(acc_dot, SIGN_EXTEND_EPI16_TO_EPI32_LO(dot_lo));
+        acc_dot = _mm_add_epi32(acc_dot, SIGN_EXTEND_EPI16_TO_EPI32_HI(dot_lo));
+        acc_dot = _mm_add_epi32(acc_dot, SIGN_EXTEND_EPI16_TO_EPI32_LO(dot_hi));
+        acc_dot = _mm_add_epi32(acc_dot, SIGN_EXTEND_EPI16_TO_EPI32_HI(dot_hi));
 
-        acc_a2 = _mm_add_epi32(acc_a2, _mm_unpacklo_epi16(a2_lo, _mm_setzero_si128()));
-        acc_a2 = _mm_add_epi32(acc_a2, _mm_unpackhi_epi16(a2_lo, _mm_setzero_si128()));
-        acc_a2 = _mm_add_epi32(acc_a2, _mm_unpacklo_epi16(a2_hi, _mm_setzero_si128()));
-        acc_a2 = _mm_add_epi32(acc_a2, _mm_unpackhi_epi16(a2_hi, _mm_setzero_si128()));
+        acc_a2 = _mm_add_epi32(acc_a2, SIGN_EXTEND_EPI16_TO_EPI32_LO(a2_lo));
+        acc_a2 = _mm_add_epi32(acc_a2, SIGN_EXTEND_EPI16_TO_EPI32_HI(a2_lo));
+        acc_a2 = _mm_add_epi32(acc_a2, SIGN_EXTEND_EPI16_TO_EPI32_LO(a2_hi));
+        acc_a2 = _mm_add_epi32(acc_a2, SIGN_EXTEND_EPI16_TO_EPI32_HI(a2_hi));
 
-        acc_b2 = _mm_add_epi32(acc_b2, _mm_unpacklo_epi16(b2_lo, _mm_setzero_si128()));
-        acc_b2 = _mm_add_epi32(acc_b2, _mm_unpackhi_epi16(b2_lo, _mm_setzero_si128()));
-        acc_b2 = _mm_add_epi32(acc_b2, _mm_unpacklo_epi16(b2_hi, _mm_setzero_si128()));
-        acc_b2 = _mm_add_epi32(acc_b2, _mm_unpackhi_epi16(b2_hi, _mm_setzero_si128()));
+        acc_b2 = _mm_add_epi32(acc_b2, SIGN_EXTEND_EPI16_TO_EPI32_LO(b2_lo));
+        acc_b2 = _mm_add_epi32(acc_b2, SIGN_EXTEND_EPI16_TO_EPI32_HI(b2_lo));
+        acc_b2 = _mm_add_epi32(acc_b2, SIGN_EXTEND_EPI16_TO_EPI32_LO(b2_hi));
+        acc_b2 = _mm_add_epi32(acc_b2, SIGN_EXTEND_EPI16_TO_EPI32_HI(b2_hi));
     }
 
-    int32_t d[4], a[4], b[4];
-    _mm_storeu_si128((__m128i *)d, acc_dot);
-    _mm_storeu_si128((__m128i *)a, acc_a2);
-    _mm_storeu_si128((__m128i *)b, acc_b2);
+    // Horizontal sum of SIMD accumulators
+    int32_t _d[4], _a[4], _b[4];
+    _mm_storeu_si128((__m128i *)_d, acc_dot);
+    _mm_storeu_si128((__m128i *)_a, acc_a2);
+    _mm_storeu_si128((__m128i *)_b, acc_b2);
 
-    int32_t total_dot = d[0] + d[1] + d[2] + d[3];
-    int32_t total_a2  = a[0] + a[1] + a[2] + a[3];
-    int32_t total_b2  = b[0] + b[1] + b[2] + b[3];
+    int32_t total_dot = _d[0] + _d[1] + _d[2] + _d[3];
+    int32_t total_a2  = _a[0] + _a[1] + _a[2] + _a[3];
+    int32_t total_b2  = _b[0] + _b[1] + _b[2] + _b[3];
 
+    // Handle tail
     for (; i < n; ++i) {
         int va = a[i];
         int vb = b[i];

@@ -126,14 +126,12 @@ typedef int (*vcursor_sort_callback)(vFullScanCursor *c);
 extern distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX];
 extern char *distance_backend_name;
 
-// MARK: - BFLOAT16 -
+// MARK: - FLOAT / BFLOAT16 -
 
 // there is a native bfloat16_t ARM intrinsic
-
 typedef uint16_t float16_t;
 typedef uint16_t bfloat16_t;
 
-/*
 static inline bfloat16_t float32_to_bfloat16 (float f) {
     uint32_t bits = *(uint32_t *)&f;
     return (bfloat16_t)(bits >> 16);
@@ -143,23 +141,93 @@ static inline float bfloat16_to_float32 (bfloat16_t bf) {
     uint32_t bits = ((uint32_t)bf) << 16;
     return *(float *)&bits;
 }
- */
+
+// convert 16-bit float (IEEE-754 binary16) to 32-bit float
+static inline float float16_to_float32 (uint16_t h) {
+    uint16_t h_exp = (h & 0x7C00u);
+    uint16_t h_sig = (h & 0x03FFu);
+    uint32_t f_sgn = ((uint32_t)h & 0x8000u) << 16;
+
+    if (h_exp == 0x0000u) {
+        // Zero or subnormal
+        if (h_sig == 0) {
+            return *((float*)&f_sgn);  // ±0.0
+        } else {
+            // Normalize subnormal
+            float result = (float)(h_sig) / 1024.0f;
+            return *((float*)&f_sgn) ? -result : result;
+        }
+    } else if (h_exp == 0x7C00u) {
+        // Inf or NaN
+        uint32_t f_inf_nan = f_sgn | 0x7F800000u | ((uint32_t)(h_sig) << 13);
+        return *((float*)&f_inf_nan);
+    }
+
+    // Normalized number
+    uint32_t f_exp = ((uint32_t)(h_exp >> 10) + (127 - 15)) << 23;
+    uint32_t f_sig = ((uint32_t)h_sig) << 13;
+    uint32_t f = f_sgn | f_exp | f_sig;
+
+    float result;
+    *((uint32_t*)&result) = f;
+    return result;
+}
+
+// convert 32-bit float to 16-bit float (IEEE-754 binary16), result stored as uint16_t
+static inline uint16_t float32_to_float16(float f) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.f = f;
+
+    uint32_t f_bits = v.u;
+
+    uint32_t sign = (f_bits >> 16) & 0x8000;
+    int32_t  exp  = ((f_bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t frac = f_bits & 0x007FFFFF;
+
+    if (exp <= 0) {
+        // Subnormal or underflow
+        if (exp < -10) {
+            // Too small for subnormal — flush to zero
+            return (uint16_t)sign;
+        }
+        // Subnormal
+        frac |= 0x00800000; // add implicit leading 1
+        int shift = 14 - exp;
+        uint16_t subnormal = (uint16_t)(frac >> shift);
+        // Round to nearest
+        if ((frac >> (shift - 1)) & 1) subnormal += 1;
+        return sign | subnormal;
+    } else if (exp >= 31) {
+        // Overflow → Inf or NaN
+        if (frac == 0) {
+            return (uint16_t)(sign | 0x7C00); // Inf
+        } else {
+            return (uint16_t)(sign | 0x7C00 | (frac >> 13)); // NaN
+        }
+    }
+
+    // Normal range: round and pack
+    uint16_t h_exp = (uint16_t)(exp << 10);
+    uint16_t h_frac = (uint16_t)(frac >> 13);
+    // Round to nearest
+    if (frac & 0x00001000) {
+        h_frac += 1;
+        if (h_frac == 0x0400) {  // mantissa overflow
+            h_frac = 0;
+            h_exp += 0x0400;
+            if (h_exp >= 0x7C00) h_exp = 0x7C00; // clamp to Inf
+        }
+    }
+
+    return (uint16_t)(sign | h_exp | h_frac);
+}
 
 // MARK: - Quantization -
 
-/*
-static inline void quantize_float32_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
-    for (int i=0; i<n; ++i) {
-        float scaled = (v[i] - offset) * scale;
-        //v[i] = (uint8_t)fminf(255.0f, fmaxf(0.0f, roundf(scaled)));
-        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));   // branchless round
-        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);            // clamp to [0, 255]
-        q[i] = (uint8_t)rounded;
-    }
-}
- */
-
-static inline void float32_quantize_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
+static inline void quantize_float32_to_u8 (float *v, uint8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
         float s0 = (v[i]     - offset) * scale;
@@ -192,6 +260,37 @@ static inline void float32_quantize_u8 (float *v, uint8_t *q, float offset, floa
     }
 }
 
+static inline void quantize_float16_to_u8 (const int16_t *v, uint8_t *q, float offset, float scale, int n) {
+    for (int i = 0; i < n; ++i) {
+        float x = (float16_to_float32((uint16_t)v[i]) - offset) * scale;
+        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));
+        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+    }
+}
+
+static inline void quantize_bfloat16_to_u8(const int16_t *v, uint8_t *q, float offset, float scale, int n) {
+    for (int i = 0; i < n; ++i) {
+        float x = (bfloat16_to_float32(v[i]) - offset) * scale;
+        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));  // round to nearest
+        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));     // clamp to [0, 255]
+    }
+}
+
+static inline void quantize_u8_to_u8 (const uint8_t *v, uint8_t *q, float offset, float scale, int n) {
+    for (int i = 0; i < n; ++i) {
+        float x = ((float)v[i] - offset) * scale;
+        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));
+        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+    }
+}
+
+static inline void quantize_i8_to_u8 (const int8_t *v, uint8_t *q, float offset, float scale, int n) {
+    for (int i = 0; i < n; ++i) {
+        float x = ((float)v[i] - offset) * scale;
+        int r = (int)(x + 0.5f * (1.0f - 2.0f * (x < 0.0f)));
+        q[i] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+    }
+}
 
 // MARK: - SQLite Utils -
 
@@ -416,7 +515,7 @@ static vector_type vector_name_to_type (const char *vname) {
     return 0;
 }
 
-static const char *vector_type_to_name (vector_type type) {
+const char *vector_type_to_name (vector_type type) {
     switch (type) {
         case VECTOR_TYPE_F32: return "FLOAT32";
         case VECTOR_TYPE_F16: return "FLOAT16";
@@ -442,6 +541,17 @@ static vector_distance distance_name_to_type (const char *dname) {
     if (strcasecmp(dname, "L1") == 0) return VECTOR_DISTANCE_L1;
     if (strcasecmp(dname, "MANHATTAN") == 0) return VECTOR_DISTANCE_L1;
     return 0;
+}
+
+const char *vector_distance_to_name (vector_distance type) {
+    switch (type) {
+        case VECTOR_DISTANCE_L2: return "L2";
+        case VECTOR_DISTANCE_SQUARED_L2: return "L2 SQUARED";
+        case VECTOR_DISTANCE_COSINE: return "COSINE";
+        case VECTOR_DISTANCE_DOT: return "DOT";
+        case VECTOR_DISTANCE_L1: return "L1";
+    }
+    return "N/A";
 }
 
 static bool sanity_check_args (sqlite3_context *context, const char *func_name, int argc, sqlite3_value **argv, int ntypes, int *types) {
@@ -786,12 +896,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         data += sizeof(int64_t);
         
         // quantize vector
-        float32_quantize_u8(v, data, offset, scale, dim);
-        /*
-        for (int i=0; i<dim; ++i) {
-            float scaled = (v[i] - offset) * scale;
-            data[i] = (uint8_t)fminf(255.0f, fmaxf(0.0f, roundf(scaled)));
-        }*/
+        quantize_float32_to_u8(v, data, offset, scale, dim);
         data += (dim * sizeof(uint8_t));
         
         max_rowid = rowid;
@@ -1458,7 +1563,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     uint8_t *v = (uint8_t *)sqlite3_malloc(dimension * sizeof(int8_t));
     if (!v) return SQLITE_NOMEM;
     
-    float32_quantize_u8((float *)v1, v, c->table->offset, c->table->scale, dimension);
+    quantize_float32_to_u8((float *)v1, v, c->table->offset, c->table->scale, dimension);
     if (c->table->preloaded) return vQuantRunMemory(c, v, dimension);
     
     char sql[STATIC_SQL_SIZE];
@@ -1600,6 +1705,11 @@ static void vector_init (sqlite3_context *context, int argc, sqlite3_value **arg
         return;
     }
     
+    if ((options.v_type == VECTOR_TYPE_F16) || (options.v_type == VECTOR_TYPE_BF16)) {
+        context_result_error(context, SQLITE_ERROR, "FLOAT16 and FLOATB16 vector types are currently under development. Please update to the latest version.");
+        return;
+    }
+    
     // check if table is already loaded
     vector_context *v_ctx = (vector_context *)sqlite3_user_data(context);
     table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
@@ -1640,7 +1750,7 @@ static void vector_backend (sqlite3_context *context, int argc, sqlite3_value **
 SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
     int rc = SQLITE_OK;
     
-    init_distance_functions();
+    init_distance_functions(false);
     
     // init context
     void *ctx = vector_context_create();
