@@ -20,6 +20,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#if defined(_WIN32) || defined(__linux__)
+#include <float.h>
+#endif
+
 #define DEBUG_VECTOR_ALWAYS(...)                    do {printf(__VA_ARGS__ );printf("\n");} while (0)
 
 #if ENABLE_VECTOR_DEBUG
@@ -853,8 +857,13 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     
     // STEP 1
     // find global min/max across ALL vectors
+    #if defined(_WIN32) || defined(__linux__)
+    float min_val = FLT_MAX;
+    float max_val = -FLT_MAX;
+    #else 
     float min_val = MAXFLOAT;
     float max_val = -MAXFLOAT;
+    #endif
     
     while (1) {
         rc = sqlite3_step(vm);
