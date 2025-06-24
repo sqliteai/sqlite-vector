@@ -88,7 +88,9 @@ CREATE TABLE images (
 -- Insert a vector (Float32, 384 dimensions)
 INSERT INTO images (embedding, label) VALUES (?, 'cat');
 
--- Initialize vector
+-- Initialize the vector. By default, the distance function is L2.
+-- To use a different metric, specify one of the following options:
+-- distance=L1, distance=COSINE, distance=DOT, or distance=SQUARED_L2.
 SELECT vector_init('images', 'embedding', 'type=FLOAT32,dimension=384');
 
 -- Quantize vector
