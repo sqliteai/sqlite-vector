@@ -18,6 +18,32 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+
+#ifdef _WIN32
+char *strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; ++haystack) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+            ++h;
+            ++n;
+        }
+        if (!*n) return (char *)haystack;
+    }
+    return NULL;
+}
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
+#include <float.h>
+#endif
+
+#ifndef SQLITE_CORE
+SQLITE_EXTENSION_INIT1
+#endif
 
 #define DEBUG_VECTOR_ALWAYS(...)                    do {printf(__VA_ARGS__ );printf("\n");} while (0)
 
@@ -842,8 +868,13 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     
     // STEP 1
     // find global min/max across ALL vectors
+    #if defined(_WIN32) || defined(__linux__)
+    float min_val = FLT_MAX;
+    float max_val = -FLT_MAX;
+    #else 
     float min_val = MAXFLOAT;
     float max_val = -MAXFLOAT;
+    #endif
     
     while (1) {
         rc = sqlite3_step(vm);
@@ -1814,6 +1845,9 @@ static void vector_backend (sqlite3_context *context, int argc, sqlite3_value **
 // MARK: -
 
 SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+    #ifndef SQLITE_CORE
+    SQLITE_EXTENSION_INIT2(pApi);
+    #endif
     int rc = SQLITE_OK;
     
     init_distance_functions(false);
