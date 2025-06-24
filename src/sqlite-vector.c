@@ -1297,11 +1297,11 @@ static void vector_convert_f32 (sqlite3_context *context, int argc, sqlite3_valu
 }
 
 static void vector_convert_f16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    //vector_convert(context, VECTOR_TYPE_F16, argc, argv);
+    vector_convert(context, VECTOR_TYPE_F16, argc, argv);
 }
 
 static void vector_convert_bf16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    //vector_convert(context, VECTOR_TYPE_BF16, argc, argv);
+    vector_convert(context, VECTOR_TYPE_BF16, argc, argv);
 }
 
 static void vector_convert_u8 (sqlite3_context *context, int argc, sqlite3_value **argv) {
