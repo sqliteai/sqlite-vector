@@ -1313,7 +1313,13 @@ static void vector_convert (sqlite3_context *context, vector_type type, int argc
     
     if (value_type == SQLITE_TEXT) {
         // try to parse JSON array value
-        char *blob = vector_convert_from_json(context, NULL, type, (const char *)sqlite3_value_text(value), &value_size);
+        const char *json = (const char *)sqlite3_value_text(value);
+        if (!json) {
+            context_result_error(context, SQLITE_ERROR, "Invalid TEXT input.");
+            return;
+        }
+        
+        char *blob = vector_convert_from_json(context, NULL, type, json, &value_size);
         if (!blob) return; // error is set in the context
         
         sqlite3_result_blob(context, (const void *)blob, value_size, sqlite3_free);
@@ -1887,6 +1893,21 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     
     // table_name, column_name
     rc = sqlite3_create_function(db, "vector_cleanup", 2, SQLITE_UTF8, ctx, vector_cleanup, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    rc = sqlite3_create_function(db, "vector_convert_f32", 1, SQLITE_UTF8, ctx, vector_convert_f32, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    rc = sqlite3_create_function(db, "vector_convert_f16", 1, SQLITE_UTF8, ctx, vector_convert_f16, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    rc = sqlite3_create_function(db, "vector_convert_bf16", 1, SQLITE_UTF8, ctx, vector_convert_bf16, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    rc = sqlite3_create_function(db, "vector_convert_i8", 1, SQLITE_UTF8, ctx, vector_convert_i8, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+    
+    rc = sqlite3_create_function(db, "vector_convert_u8", 1, SQLITE_UTF8, ctx, vector_convert_u8, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_module(db, "vector_full_scan", &vFullScanModule, ctx);
