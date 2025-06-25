@@ -12,26 +12,8 @@
 * ✅ **Plug-and-play** – drop into existing SQLite workflows with minimal effort
 * ✅ **Cross-platform** – works out of the box on all major OSes
 
----
 
-## 🧠 What Is Vector Search?
-
-Vector search is the process of finding the closest match(es) to a given vector (a point in high-dimensional space) based on a similarity or distance metric. It is essential for AI and machine learning applications where data is often encoded into vector embeddings.
-
-### Common Use Cases
-
-* **Semantic Search**: find documents, emails, or messages similar to a query
-* **Image Retrieval**: search for visually similar images
-* **Recommendation Systems**: match users with products, videos, or music
-* **Voice and Audio Search**: match voice queries or environmental sounds
-* **Anomaly Detection**: find outliers in real-time sensor data
-* **Robotics**: localize spatial features or behaviors using embedded observations
-
-In the AI era, embeddings are everywhere – from language models like GPT to vision transformers. Storing and searching them efficiently is the foundation of intelligent applications.
-
----
-
-## 🧩 Why Use SQLite-Vector?
+## Why Use SQLite-Vector?
 
 | Feature                    | SQLite-Vector | Traditional Solutions                      |
 | -------------------------- | ------------- | ------------------------------------------ |
@@ -45,52 +27,32 @@ In the AI era, embeddings are everywhere – from language models like GPT to vi
 
 Unlike other vector databases or extensions that require complex setup, SQLite-Vector **just works** with your existing database schema and tools.
 
----
 
-### 🚀 Instant Vector Search – No Preindexing Required
+## 📦 Installation
 
-Unlike other SQLite vector extensions that rely on complex indexing algorithms such as DiskANN, HNSW, or IVF, which often require **preprocessing steps that can take hours or even days**, `sqlite-vector` works out of the box with your existing data. There’s **no need to preindex your vectors**—you can start performing fast, approximate or exact vector searches **immediately**.
+### Pre-built Binaries
 
-This means:
+Download the appropriate pre-built binary for your platform from the official [Releases](https://github.com/sqliteai/sqlite-vector/releases) page:
 
-* 🕒 **No waiting time** before your app or service is usable
-* 🔄 **Zero-cost updates** – you can add, remove, or modify vectors on the fly without rebuilding any index
-* ⚡ **Works directly with BLOB columns** in ordinary SQLite tables – no special schema or virtual table required
-* 🌍 **Ideal for edge and mobile use cases**, where preprocessing large datasets is not practical or possible
+- Linux: x86 and ARM
+- macOS: x86 and ARM
+- Windows: x86
+- Android
+- iOS
 
-By eliminating the need for heavyweight indexing, `sqlite-vector` offers a **simpler, faster, and more developer-friendly** approach to embedding vector search in your applications.
+### Loading the Extension
 
----
+```sql
+-- In SQLite CLI
+.load ./vector
 
-## 🛠 Supported Vector Types
+-- In SQL
+SELECT load_extension('./vector');
+```
 
-You can store your vectors as `BLOB` columns in ordinary tables. Supported formats include:
+Or embed it directly into your application.
 
-* `float32` (4 bytes per element)
-* `float16` (2 bytes per element)
-* `bfloat16` (2 bytes per element)
-* `int8` (1 byte per element)
-* `uint8` (1 byte per element)
-
-Simply insert a vector as a binary blob into your table. No special table types or schemas are required.
-
----
-
-## 📐 Supported Distance Metrics
-
-Optimized implementations available:
-
-* **L2 Distance (Euclidean)**
-* **Squared L2**
-* **L1 Distance (Manhattan)**
-* **Cosine Distance**
-* **Dot Product**
-
-These are implemented in pure C and optimized for SIMD when available, ensuring maximum performance on modern CPUs and mobile devices.
-
----
-
-## 🔍 Example Usage
+## Example Usage
 
 ```sql
 -- Create a regular SQLite table
@@ -120,35 +82,66 @@ SELECT e.id, v.distance FROM images AS e
    ON e.id = v.rowid;
 ```
 
----
-
-## 📦 Installation
-
-### Pre-built Binaries
-
-Download the appropriate pre-built binary for your platform from the official [Releases](https://github.com/sqliteai/sqlite-vector/releases) page:
-
-- Linux: x86 and ARM
-- macOS: x86 and ARM
-- Windows: x86
-- Android
-- iOS
-
-### Loading the Extension
-
-```sql
--- In SQLite CLI
-.load ./vector
-
--- In SQL
-SELECT load_extension('./vector');
-```
-
-Or embed it directly into your application.
-
 ## 📋 Documentation
 
 Extensive API documentation can be found in the [API page](https://github.com/sqliteai/sqlite-vector/blob/main/API.md)
+
+## 🧩 Features
+
+### Instant Vector Search – No Preindexing Required
+
+Unlike other SQLite vector extensions that rely on complex indexing algorithms such as DiskANN, HNSW, or IVF, which often require **preprocessing steps that can take hours or even days**, `sqlite-vector` works out of the box with your existing data. There’s **no need to preindex your vectors**—you can start performing fast, approximate or exact vector searches **immediately**.
+
+This means:
+
+* 🕒 **No waiting time** before your app or service is usable
+* 🔄 **Zero-cost updates** – you can add, remove, or modify vectors on the fly without rebuilding any index
+* ⚡ **Works directly with BLOB columns** in ordinary SQLite tables – no special schema or virtual table required
+* 🌍 **Ideal for edge and mobile use cases**, where preprocessing large datasets is not practical or possible
+
+By eliminating the need for heavyweight indexing, `sqlite-vector` offers a **simpler, faster, and more developer-friendly** approach to embedding vector search in your applications.
+
+### Supported Vector Types
+
+You can store your vectors as `BLOB` columns in ordinary tables. Supported formats include:
+
+* `float32` (4 bytes per element)
+* `float16` (2 bytes per element)
+* `bfloat16` (2 bytes per element)
+* `int8` (1 byte per element)
+* `uint8` (1 byte per element)
+
+Simply insert a vector as a binary blob into your table. No special table types or schemas are required.
+
+
+### Supported Distance Metrics
+
+Optimized implementations available:
+
+* **L2 Distance (Euclidean)**
+* **Squared L2**
+* **L1 Distance (Manhattan)**
+* **Cosine Distance**
+* **Dot Product**
+
+These are implemented in pure C and optimized for SIMD when available, ensuring maximum performance on modern CPUs and mobile devices.
+
+---
+
+# 🧠 What Is Vector Search?
+
+Vector search is the process of finding the closest match(es) to a given vector (a point in high-dimensional space) based on a similarity or distance metric. It is essential for AI and machine learning applications where data is often encoded into vector embeddings.
+
+### Common Use Cases
+
+* **Semantic Search**: find documents, emails, or messages similar to a query
+* **Image Retrieval**: search for visually similar images
+* **Recommendation Systems**: match users with products, videos, or music
+* **Voice and Audio Search**: match voice queries or environmental sounds
+* **Anomaly Detection**: find outliers in real-time sensor data
+* **Robotics**: localize spatial features or behaviors using embedded observations
+
+In the AI era, embeddings are everywhere – from language models like GPT to vision transformers. Storing and searching them efficiently is the foundation of intelligent applications.
 
 ## 🌍 Perfect for Edge AI
 
