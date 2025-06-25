@@ -1,6 +1,6 @@
-# SQLite-Vector: Fast, Lightweight Vector Search Extension for SQLite
+# SQLite Vector
 
-**SQLite-Vector** is a cross-platform, ultra-efficient SQLite extension that brings vector search capabilities to your embedded database. It works seamlessly on **iOS, Android, Windows, Linux, and macOS**, using just **30MB of memory** by default. With support for **Float32, Float16, BFloat16, Int8, and UInt8**, and **highly optimized distance functions**, it's the ideal solution for **Edge AI** applications.
+**SQLite Vector** is a cross-platform, ultra-efficient SQLite extension that brings vector search capabilities to your embedded database. It works seamlessly on **iOS, Android, Windows, Linux, and macOS**, using just **30MB of memory** by default. With support for **Float32, Float16, BFloat16, Int8, and UInt8**, and **highly optimized distance functions**, it's the ideal solution for **Edge AI** applications.
 
 ## 🚀 Highlights
 
