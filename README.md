@@ -47,6 +47,21 @@ Unlike other vector databases or extensions that require complex setup, SQLite-V
 
 ---
 
+### 🚀 Instant Vector Search – No Preindexing Required
+
+Unlike other SQLite vector extensions that rely on complex indexing algorithms such as DiskANN, HNSW, or IVF, which often require **preprocessing steps that can take hours or even days**, `sqlite-vector` works out of the box with your existing data. There’s **no need to preindex your vectors**—you can start performing fast, approximate or exact vector searches **immediately**.
+
+This means:
+
+* 🕒 **No waiting time** before your app or service is usable
+* 🔄 **Zero-cost updates** – you can add, remove, or modify vectors on the fly without rebuilding any index
+* ⚡ **Works directly with BLOB columns** in ordinary SQLite tables – no special schema or virtual table required
+* 🌍 **Ideal for edge and mobile use cases**, where preprocessing large datasets is not practical or possible
+
+By eliminating the need for heavyweight indexing, `sqlite-vector` offers a **simpler, faster, and more developer-friendly** approach to embedding vector search in your applications.
+
+---
+
 ## 🛠 Supported Vector Types
 
 You can store your vectors as `BLOB` columns in ordinary tables. Supported formats include:
