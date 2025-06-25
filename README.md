@@ -101,7 +101,7 @@ SELECT vector_quantize_preload('images', 'embedding');
 
 -- Run a nearest neighbor query (returns top 20 closest vectors)
 SELECT e.id, v.distance FROM images AS e
-   JOIN vector_quantize_scan('images', 'embedding', 20) AS v
+   JOIN vector_quantize_scan('images', 'embedding', ?, 20) AS v
    ON e.id = v.rowid;
 ```
 
