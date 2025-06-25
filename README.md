@@ -131,6 +131,10 @@ SELECT load_extension('./vector');
 
 Or embed it directly into your application.
 
+## 📋 Documentation
+
+Extensive API documentation can be found in the [API page](https://github.com/sqliteai/sqlite-vector/blob/main/API.md)
+
 ## 🌍 Perfect for Edge AI
 
 SQLite-Vector is designed with the **Edge AI** use case in mind:
