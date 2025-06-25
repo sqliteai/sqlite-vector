@@ -20,7 +20,7 @@
 char *distance_backend_name = "CPU";
 distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX] = {0};
 
-// MARK: - FLOAT32 -
+// MARK: FLOAT32 -
 
 float float32_distance_l2_impl_cpu (const void *v1, const void *v2, int n, bool use_sqrt) {
     const float *a = (const float *)v1;
