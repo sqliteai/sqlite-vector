@@ -166,7 +166,11 @@ SELECT vector_cleanup('documents', 'embedding');
 **Returns:** `BLOB`
 
 **Description:**
-Encodes a vector into the required internal BLOB format. This ensures proper insertion of vector values in the chosen format.
+Encodes a vector into the required internal BLOB format to ensure correct storage and compatibility with the system’s vector representation.
+
+Functions in the `vector_convert_` family should be used in all `INSERT`, `UPDATE`, and `DELETE` statements to properly format vector values. However, they are *not* required when specifying input vectors for the `vector_full_scan` or `vector_quantize_scan` virtual tables.
+
+Optionally, these functions accept a `dimension INT` argument (placed before the vector value) to enforce a stricter sanity check, ensuring the input vector has the expected dimensionality.
 
 **Parameters:**
 
