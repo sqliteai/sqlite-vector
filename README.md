@@ -87,7 +87,9 @@ SELECT e.id, v.distance FROM images AS e
 
 ## 📋 Documentation
 
-Extensive API documentation can be found in the [API page](https://github.com/sqliteai/sqlite-vector/blob/main/API.md)
+Extensive API documentation can be found in the [API page](https://github.com/sqliteai/sqlite-vector/blob/main/API.md).
+
+More information about the quantization process can be found in the [QUANTIZATION document](https://github.com/sqliteai/sqlite-vector/blob/main/QUANTIZATION.md).
 
 ## 🧩 Features
 
