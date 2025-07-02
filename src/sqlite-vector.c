@@ -1175,7 +1175,7 @@ static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **
 
 // MARK: -
 
-static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vector_type type, const char *json, int *size) {
+static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vector_type type, const char *json, int *size, int dimension) {
     char *blob = NULL;
     
     // skip leading whitespace
@@ -1292,6 +1292,12 @@ static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *v
         }
     }
     
+    // sanity check vector dimension
+    if ((dimension > 0) && (dimension != count)) {
+        sqlite3_free(blob);
+        return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Invalid JSON vector dimension: expected %d but found %d.", dimension, count);
+    }
+    
     if (size) *size = (int)(count * item_size);
     return blob;
 }
@@ -1301,12 +1307,23 @@ static void vector_convert (sqlite3_context *context, vector_type type, int argc
     int value_size = sqlite3_value_bytes(value);
     int value_type = sqlite3_value_type(value);
     
+    // dimension is an optional argument
+    int dimension = (argc == 2) ? sqlite3_value_int(argv[1]) : 0;
+    
     if (value_type == SQLITE_BLOB) {
         // the only check we can perform is that the blob size is an exact multiplier of the vector type
         if (value_size % vector_type_to_size(type) != 0) {
             context_result_error(context, SQLITE_ERROR, "Invalid BLOB size for format '%s': size must be a multiple of %d bytes.", vector_type_to_name(type), vector_type_to_size(type));
             return;
         }
+        if (dimension > 0) {
+            int expected_size = (int)vector_type_to_size(type) * dimension;
+            if (value_size != expected_size) {
+                context_result_error(context, SQLITE_ERROR, "Invalid BLOB size for format '%s': expected dimension should be %d (BLOB is %d bytes instead of %d).", vector_type_to_name(type), dimension, value_size, expected_size);
+                return;
+            }
+        }
+        
         sqlite3_result_value(context, value);
         return;
     }
@@ -1319,7 +1336,7 @@ static void vector_convert (sqlite3_context *context, vector_type type, int argc
             return;
         }
         
-        char *blob = vector_convert_from_json(context, NULL, type, json, &value_size);
+        char *blob = vector_convert_from_json(context, NULL, type, json, &value_size, dimension);
         if (!blob) return; // error is set in the context
         
         sqlite3_result_blob(context, (const void *)blob, value_size, sqlite3_free);
@@ -1393,7 +1410,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     int vsize = 0;
     if (sqlite3_value_type(argv[2]) == SQLITE_TEXT) {
         vsize = sqlite3_value_bytes(argv[2]);
-        vector = (const void *)vector_convert_from_json(NULL, &vtab->base, t_ctx->options.v_type, (const char *)sqlite3_value_text(argv[2]), &vsize);
+        vector = (const void *)vector_convert_from_json(NULL, &vtab->base, t_ctx->options.v_type, (const char *)sqlite3_value_text(argv[2]), &vsize, t_ctx->options.v_dim);
         if (!vector) return SQLITE_ERROR; // error already set inside vector_convert_from_json
     } else {
         vector = (const void *)sqlite3_value_blob(argv[2]);
@@ -1896,18 +1913,23 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_convert_f32", 1, SQLITE_UTF8, ctx, vector_convert_f32, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_convert_f32", 2, SQLITE_UTF8, ctx, vector_convert_f32, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_convert_f16", 1, SQLITE_UTF8, ctx, vector_convert_f16, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_convert_f16", 2, SQLITE_UTF8, ctx, vector_convert_f16, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_convert_bf16", 1, SQLITE_UTF8, ctx, vector_convert_bf16, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_convert_bf16", 2, SQLITE_UTF8, ctx, vector_convert_bf16, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_convert_i8", 1, SQLITE_UTF8, ctx, vector_convert_i8, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_convert_i8", 2, SQLITE_UTF8, ctx, vector_convert_i8, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_convert_u8", 1, SQLITE_UTF8, ctx, vector_convert_u8, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_convert_u8", 2, SQLITE_UTF8, ctx, vector_convert_u8, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_module(db, "vector_full_scan", &vFullScanModule, ctx);
