@@ -2,6 +2,13 @@
 
 This extension enables efficient vector operations directly inside SQLite databases, making it ideal for on-device and edge AI applications. It supports various vector types and SIMD-accelerated distance functions.
 
+### Getting started
+
+* All vectors must have a fixed dimension per column, set during `vector_init`.
+* Only tables explicitly initialized using `vector_init` are eligible for vector search.
+* You **must run `vector_quantize()`** before using `vector_quantize_scan()`.
+* You can preload quantization at database open using `vector_quantize_preload()`.
+
 ---
 
 ## `vector_version()`
@@ -88,6 +95,7 @@ SELECT vector_init('documents', 'embedding', 'dimension=384,type=FLOAT32,distanc
 
 **Description:**
 Performs quantization on the specified table and column. This precomputes internal data structures to support fast approximate nearest neighbor (ANN) search.
+Read more about quantization [here](https://github.com/sqliteai/sqlite-vector/blob/main/QUANTIZATION.md).
 
 **Parameters:**
 
@@ -130,6 +138,8 @@ SELECT vector_quantize_memory('documents', 'embedding');
 **Description:**
 Loads the quantized representation for the specified table and column into memory. Should be used at startup to ensure optimal query performance.
 
+Execute it after `vector_quantize()` to reflect changes.
+
 **Example:**
 
 ```sql
@@ -170,14 +180,14 @@ Encodes a vector into the required internal BLOB format to ensure correct storag
 
 Functions in the `vector_convert_` family should be used in all `INSERT`, `UPDATE`, and `DELETE` statements to properly format vector values. However, they are *not* required when specifying input vectors for the `vector_full_scan` or `vector_quantize_scan` virtual tables.
 
-Optionally, these functions accept a `dimension INT` argument (placed before the vector value) to enforce a stricter sanity check, ensuring the input vector has the expected dimensionality.
-
 **Parameters:**
 
 * `value` (TEXT or BLOB):
 
   * If `TEXT`, it must be a JSON array (e.g., `"[0.1, 0.2, 0.3]"`).
   * If `BLOB`, no check is performed; the user must ensure the format matches the specified type and dimension.
+
+* `dimension` (INT, optional): Enforce a stricter sanity check, ensuring the input vector has the expected dimensionality.
 
 **Usage by format:**
 
@@ -221,6 +231,8 @@ FROM vector_full_scan('documents', 'embedding', vector_convert_f32('[0.1, 0.2, 0
 **Description:**
 Performs a fast approximate nearest neighbor search using the pre-quantized data. This is the **recommended query method** for large datasets due to its excellent speed/recall/memory trade-off.
 
+You **must run `vector_quantize()`** before using `vector_quantize_scan()` and when data initialized for vectors changes.
+
 **Parameters:**
 
 * `table` (TEXT): Name of the target table.
@@ -242,10 +254,3 @@ FROM vector_quantize_scan('documents', 'embedding', vector_convert_f32('[0.1, 0.
 ```
 
 ---
-
-## 📌 Notes
-
-* All vectors must have a fixed dimension per column, set during `vector_init`.
-* Only tables explicitly initialized using `vector_init` are eligible for vector search.
-* You **must run `vector_quantize()`** before using `vector_quantize_scan()`.
-* You can preload quantization at database open using `vector_quantize_preload()`.
