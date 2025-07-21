@@ -735,6 +735,17 @@ void *vector_context_create (void) {
     return (void *)ctx;
 }
 
+void vector_context_free (void *p) {
+    if (p) {
+        vector_context *ctx = (vector_context *)p;
+        for (int i=0; i<ctx->table_count; ++i) {
+            if (ctx->tables[i].t_name) sqlite3_free(ctx->tables[i].t_name);
+            if (ctx->tables[i].c_name) sqlite3_free(ctx->tables[i].c_name);
+        }
+        sqlite3_free(p);
+    }
+}
+
 table_context *vector_context_lookup (vector_context *ctx, const char *table_name, const char *column_name) {
     for (int i=0; i<ctx->table_count; ++i) {
         // tname and cname can be NULL after adding vector_cleanup function
@@ -1882,7 +1893,7 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
         return SQLITE_NOMEM;
     }
     
-    rc = sqlite3_create_function(db, "vector_version", 0, SQLITE_UTF8, ctx, vector_version, NULL, NULL);
+    rc = sqlite3_create_function_v2(db, "vector_version", 0, SQLITE_UTF8, ctx, vector_version, NULL, NULL, vector_context_free);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_backend", 0, SQLITE_UTF8, ctx, vector_backend, NULL, NULL);
