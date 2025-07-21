@@ -741,6 +741,8 @@ void vector_context_free (void *p) {
         for (int i=0; i<ctx->table_count; ++i) {
             if (ctx->tables[i].t_name) sqlite3_free(ctx->tables[i].t_name);
             if (ctx->tables[i].c_name) sqlite3_free(ctx->tables[i].c_name);
+            if (ctx->tables[i].pk_name) sqlite3_free(ctx->tables[i].pk_name);
+            if (ctx->tables[i].preloaded) sqlite3_free(ctx->tables[i].preloaded);
         }
         sqlite3_free(p);
     }
@@ -1433,12 +1435,17 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     // nothing needs to be returned
     if (k == 0) return SQLITE_DONE;
     
-    c->rowids = (sqlite3_int64 *)sqlite3_malloc(k * sizeof(sqlite3_int64));
-    if (c->rowids == NULL) return SQLITE_NOMEM;
-    memset(c->rowids, 0, k*sizeof(sqlite3_int64));
+    if (c->row_count != k) {
+        if (c->rowids) sqlite3_free(c->rowids);
+        c->rowids = (sqlite3_int64 *)sqlite3_malloc(k * sizeof(sqlite3_int64));
+        if (c->rowids == NULL) return SQLITE_NOMEM;
+        
+        if (c->distance) sqlite3_free(c->distance);
+        c->distance = (double *)sqlite3_malloc(k * sizeof(double));
+        if (c->distance == NULL) return SQLITE_NOMEM;
+    }
     
-    c->distance = (double *)sqlite3_malloc(k * sizeof(double));
-    if (c->distance == NULL) return SQLITE_NOMEM;
+    memset(c->rowids, 0, k*sizeof(sqlite3_int64));
     for (int i=0; i<k; ++i) c->distance[i] = INFINITY;
     
     c->size = 0;
@@ -1695,7 +1702,11 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     if (!v) return SQLITE_NOMEM;
     
     quantize_float32_to_u8((float *)v1, v, c->table->offset, c->table->scale, dimension);
-    if (c->table->preloaded) return vQuantRunMemory(c, v, dimension);
+    if (c->table->preloaded) {
+        int rc = vQuantRunMemory(c, v, dimension);
+        if (v) sqlite3_free(v);
+        return rc;
+    }
     
     char sql[STATIC_SQL_SIZE];
     generate_select_quant_table(c->table->t_name, c->table->c_name, sql);
@@ -1743,6 +1754,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
 kann_run_cleanup:
     if (rc != SQLITE_OK) printf("Error in vector_rebuild_quantization: %s\n", sqlite3_errmsg(db));
     if (vm) sqlite3_finalize(vm);
+    if (v) sqlite3_free(v);
     return rc;
 }
 
