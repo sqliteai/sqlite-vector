@@ -159,6 +159,14 @@ SQLite-Vector is designed with the **Edge AI** use case in mind:
 
 You can deploy powerful similarity search capabilities right inside your app or embedded system – **no cloud needed**.
 
+## 📦 Integrations
+
+Use SQLite-AI alongside:
+
+* **[SQLite-AI](https://github.com/sqliteai/sqlite-ai)** – on-device inference, embedding generation, and model interaction directly into your database
+* **[SQLite-Sync](https://github.com/sqliteai/sqlite-sync)** – sync on-device databases with the cloud
+* **[SQLite-JS](https://github.com/sqliteai/sqlite-js)** – define SQLite functions in JavaScript
+
 ## License
 
 This project is licensed under the [Elastic License 2.0](./LICENSE.md). You can use, copy, modify, and distribute it under the terms of the license for non-production use. For production or managed service use, please [contact SQLite Cloud, Inc](mailto:info@sqlitecloud.io) for a commercial license.
