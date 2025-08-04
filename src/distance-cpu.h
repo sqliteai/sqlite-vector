@@ -21,7 +21,9 @@ typedef enum {
 #define VECTOR_TYPE_MAX         6
 
 typedef enum {
-    VECTOR_QUANT_8BIT = 1
+    VECTOR_QUANT_AUTO = 0,
+    VECTOR_QUANT_U8BIT = 1,
+    VECTOR_QUANT_S8BIT = 2
 } vector_qtype;
 
 typedef enum {
