@@ -832,8 +832,12 @@ static char *generate_memory_quant_table (const char *table_name, const char *co
     return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT SUM(LENGTH(data)) FROM vector0_%q_%q;", table_name, column_name);
 }
 
-static char * generate_insert_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+static char *generate_insert_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
     return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "INSERT INTO vector0_%q_%q (rowid1, rowid2, counter, data) VALUES (?, ?, ?, ?);", table_name, column_name);
+}
+
+static char *generate_quant_table_name (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "vector0_%q_%q", table_name, column_name);
 }
 
 // MARK: - Vector Context and Options -
@@ -1513,7 +1517,7 @@ static void vector_convert_i8 (sqlite3_context *context, int argc, sqlite3_value
 
 // MARK: - Modules -
 
-static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char *idxStr, int argc, sqlite3_value **argv, const char *fname, vcursor_run_callback run_callback, vcursor_sort_callback sort_callback) {
+static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char *idxStr, int argc, sqlite3_value **argv, const char *fname, vcursor_run_callback run_callback, vcursor_sort_callback sort_callback, bool check_quant) {
     
     vFullScanCursor *c = (vFullScanCursor *)cur;
     vFullScan *vtab = (vFullScan *)cur->pVtab;
@@ -1560,6 +1564,15 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     } else {
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
+    }
+    
+    if (check_quant) {
+        char buffer[STATIC_SQL_SIZE];
+        char *name = generate_quant_table_name(table_name, column_name, buffer);
+        if (!name || !sqlite_table_exists(vtab->db, name)) {
+            sqlite_vtab_set_error(&vtab->base, "Quantization table not found for table '%s' and column '%s'. Ensure that vector_quantize() has been called before using vector_quantize_scan().");
+            return SQLITE_ERROR;
+        }
     }
     
     int k = sqlite3_value_int(argv[3]);
@@ -1785,7 +1798,7 @@ cleanup:
 }
 
 static int vFullScanCursorFilter (sqlite3_vtab_cursor *cur, int idxNum, const char *idxStr, int argc, sqlite3_value **argv) {
-    return vCursorFilterCommon(cur, idxNum, idxStr, argc, argv, "vector_full_scan", vFullScanRun, vFullScanSortSlots);
+    return vCursorFilterCommon(cur, idxNum, idxStr, argc, argv, "vector_full_scan", vFullScanRun, vFullScanSortSlots, false);
 }
 
 // MARK: -
@@ -1897,7 +1910,7 @@ kann_run_cleanup:
 
 
 static int vQuantCursorFilter (sqlite3_vtab_cursor *cur, int idxNum, const char *idxStr, int argc, sqlite3_value **argv) {
-    return vCursorFilterCommon(cur, idxNum, idxStr, argc, argv, "vector_quantize_scan", vQuantRun, vFullScanSortSlots);
+    return vCursorFilterCommon(cur, idxNum, idxStr, argc, argv, "vector_quantize_scan", vQuantRun, vFullScanSortSlots, true);
 }
  
 static sqlite3_module vFullScanModule = {
