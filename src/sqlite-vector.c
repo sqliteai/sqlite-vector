@@ -847,7 +847,6 @@ void *vector_context_create (void) {
 }
 
 void vector_context_free (void *p) {
-    return;
     if (p) {
         vector_context *ctx = (vector_context *)p;
         for (int i=0; i<ctx->table_count; ++i) {
@@ -2036,7 +2035,6 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     
     init_distance_functions(false);
     
-    // TODO: error message must be duplicate here?
     // create internal table
     rc = sqlite3_exec(db, VECTOR_INTERNAL_TABLE, NULL, NULL, NULL);
     if (rc != SQLITE_OK) return rc;
