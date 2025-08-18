@@ -99,7 +99,7 @@ SQLITE_EXTENSION_INIT1
 #define OPTION_KEY_QUANTSCALE                       "qscale"        // used only in serialize/unserialize
 #define OPTION_KEY_QUANTOFFSET                      "qoffset"       // used only in serialize/unserialize
 
-#define VECTOR_INTERNAL_TABLE                       "CREATE TABLE IF NOT EXISTS __vector (tblname TEXT, colname TEXT, key TEXT, value ANY, PRIMARY KEY(tblname, colname, key));"
+#define VECTOR_INTERNAL_TABLE                       "CREATE TABLE IF NOT EXISTS _sqliteai_vector (tblname TEXT, colname TEXT, key TEXT, value ANY, PRIMARY KEY(tblname, colname, key));"
 
 typedef struct {
     vector_type     v_type;                 // vector type
@@ -477,7 +477,7 @@ static void *sqlite_common_set_error (sqlite3_context *context, sqlite3_vtab *vt
 }
 
 static int sqlite_serialize (sqlite3_context *context, const char *table_name, const char *column_name, int type, const char *key, int64_t ivalue, double fvalue) {
-    const char *sql = "REPLACE INTO __vector (tblname, colname, key, value) VALUES (?, ?, ?, ?);";
+    const char *sql = "REPLACE INTO _sqliteai_vector (tblname, colname, key, value) VALUES (?, ?, ?, ?);";
     sqlite3 *db = sqlite3_context_db_handle(context);
     sqlite3_stmt *vm = NULL;
     
@@ -509,7 +509,7 @@ cleanup:
 }
 
 static int sqlite_unserialize (sqlite3_context *context, table_context *ctx) {
-    const char *sql = "SELECT key, value FROM __vector WHERE tblname = ? AND colname = ?;";
+    const char *sql = "SELECT key, value FROM _sqliteai_vector WHERE tblname = ? AND colname = ?;";
     sqlite3 *db = sqlite3_context_db_handle(context);
     sqlite3_stmt *vm = NULL;
     
