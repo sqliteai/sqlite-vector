@@ -138,7 +138,7 @@ typedef struct {
 typedef struct {
     sqlite3_vtab_cursor base;               // Base class - must be first
     
-    sqlite3_int64       *rowids;
+    int64_t             *rowids;
     double              *distance;
     
     int                 size;
@@ -1582,7 +1582,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     
     if (c->row_count != k) {
         if (c->rowids) sqlite3_free(c->rowids);
-        c->rowids = (sqlite3_int64 *)sqlite3_malloc(k * sizeof(sqlite3_int64));
+        c->rowids = (int64_t *)sqlite3_malloc(k * sizeof(int64_t));
         if (c->rowids == NULL) return SQLITE_NOMEM;
         
         if (c->distance) sqlite3_free(c->distance);
@@ -1590,7 +1590,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         if (c->distance == NULL) return SQLITE_NOMEM;
     }
     
-    memset(c->rowids, 0, k*sizeof(sqlite3_int64));
+    memset(c->rowids, 0, k * sizeof(int64_t));
     for (int i=0; i<k; ++i) c->distance[i] = INFINITY;
     
     c->size = 0;
@@ -1696,7 +1696,7 @@ static int vFullScanCursorEof (sqlite3_vtab_cursor *cur){
 static int vFullScanCursorColumn (sqlite3_vtab_cursor *cur, sqlite3_context *context, int iCol) {
     vFullScanCursor *c = (vFullScanCursor *)cur;
     if (iCol == VECTOR_COLUMN_ROWID) {
-        sqlite3_result_int64(context, c->rowids[c->row_index]);
+        sqlite3_result_int64(context, (sqlite3_int64)c->rowids[c->row_index]);
     } else if (iCol == VECTOR_COLUMN_DISTANCE) {
         sqlite3_result_double(context, c->distance[c->row_index]);
     }
@@ -1705,7 +1705,7 @@ static int vFullScanCursorColumn (sqlite3_vtab_cursor *cur, sqlite3_context *con
 
 static int vFullScanCursorRowid (sqlite3_vtab_cursor *cur, sqlite_int64 *pRowid) {
     vFullScanCursor *c = (vFullScanCursor *)cur;
-    *pRowid = c->rowids[c->row_index];
+    *pRowid = (sqlite_int64)c->rowids[c->row_index];
     return SQLITE_OK;
 }
 
@@ -1739,17 +1739,17 @@ static inline int vFullScanFindMaxIndex (double *values, int n) {
 }
 
 static int vFullScanSortSlots (vFullScanCursor *c) {
-    int    counter = 0;
-    int    row_count = c->row_count;
-    double *distance = c->distance;
-    sqlite3_int64 *rowids = c->rowids;
+    int     counter = 0;
+    int     row_count = c->row_count;
+    double  *distance = c->distance;
+    int64_t *rowids = c->rowids;
     
     for (int i = 0; i < row_count - 1; ++i) {
         if (distance[i] == INFINITY) ++counter;
         for (int j = i + 1; j < row_count; ++j) {
             if (distance[j] < distance[i]) {
                 SWAP(double, distance[i], distance[j]);
-                SWAP(sqlite3_int64, rowids[i], rowids[j]);
+                SWAP(int64_t, rowids[i], rowids[j]);
             }
         }
     }
@@ -1786,7 +1786,7 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
         
         if (distance < c->distance[c->max_index]) {
             c->distance[c->max_index] = distance;
-            c->rowids[c->max_index] = sqlite3_column_int64(vm, 0);
+            c->rowids[c->max_index] = (int64_t)sqlite3_column_int64(vm, 0);
             c->max_index = vFullScanFindMaxIndex(c->distance, c->row_count);
         }
     }
@@ -1811,7 +1811,7 @@ static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, vector_qtype qtype, i
     const size_t total_stride = rowid_size + vector_size;
 
     double *distance = c->distance;
-    int64_t *rowids = c->rowids;
+    int64_t *rowids = (int64_t *)c->rowids;
     int max_index = c->max_index;
     double current_max = distance[max_index];
     
