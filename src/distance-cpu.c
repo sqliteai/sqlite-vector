@@ -296,34 +296,37 @@ float int8_distance_cosine_cpu (const void *v1, const void *v2, int n) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
     
-    float dot = 0.0f, norm_a2 = 0.0f, norm_b2 = 0.0f;
+    int32_t dot = 0;
+    int32_t norm_a2 = 0;
+    int32_t norm_b2 = 0;
+    
     int i = 0;
-
     for (; i <= n - 4; i += 4) {
-        float a0 = (float)a[i + 0], b0 = (float)b[i + 0];
-        float a1 = (float)a[i + 1], b1 = (float)b[i + 1];
-        float a2 = (float)a[i + 2], b2 = (float)b[i + 2];
-        float a3 = (float)a[i + 3], b3 = (float)b[i + 3];
+        int32_t a0 = a[i + 0], b0 = b[i + 0];
+        int32_t a1 = a[i + 1], b1 = b[i + 1];
+        int32_t a2 = a[i + 2], b2 = b[i + 2];
+        int32_t a3 = a[i + 3], b3 = b[i + 3];
 
         dot     += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
         norm_a2 += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
         norm_b2 += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3;
     }
 
+    // tail loop
     for (; i < n; ++i) {
-        float ai = (float)a[i];
-        float bi = (float)b[i];
+        int32_t ai = a[i];
+        int32_t bi = b[i];
         dot     += ai * bi;
         norm_a2 += ai * ai;
         norm_b2 += bi * bi;
     }
 
-    if (norm_a2 == 0.0f || norm_b2 == 0.0f) {
+    if (norm_a2 == 0 || norm_b2 == 0) {
         return 1.0f;
     }
 
-    float cosine_sim = dot / (sqrtf(norm_a2) * sqrtf(norm_b2));
-    return 1.0f - cosine_sim;
+    float cosine_similarity = dot / (sqrtf((float)norm_a2) * sqrtf((float)norm_b2));
+    return 1.0f - cosine_similarity;
 }
 
 float int8_distance_dot_cpu (const void *v1, const void *v2, int n) {
