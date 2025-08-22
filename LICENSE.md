@@ -1,5 +1,3 @@
-# LICENSE.md
-
 Elastic License 2.0 (modified for open-source use)
 
 Copyright © 2025 SQLite Cloud, Inc.
