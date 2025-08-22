@@ -69,7 +69,7 @@ else ifeq ($(PLATFORM),android)
 
     CC = $(BIN)/$(ARCH)-linux-android26-clang
     TARGET := $(DIST_DIR)/vector.so
-    LDFLAGS += -shared
+    LDFLAGS += -lm -shared
 else ifeq ($(PLATFORM),ios)
     TARGET := $(DIST_DIR)/vector.dylib
     SDK := -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=11.0
