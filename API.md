@@ -163,22 +163,23 @@ SELECT vector_cleanup('documents', 'embedding');
 
 ---
 
-## `vector_convert_f32(value)`
+## `vector_as_f32(value)`
 
-## `vector_convert_f16(value)`
+## `vector_as_f16(value)`
 
-## `vector_convert_bf16(value)`
+## `vector_as_bf16(value)`
 
-## `vector_convert_i8(value)`
+## `vector_as_i8(value)`
 
-## `vector_convert_u8(value)`
+## `vector_as_u8(value)`
 
 **Returns:** `BLOB`
 
 **Description:**
 Encodes a vector into the required internal BLOB format to ensure correct storage and compatibility with the system’s vector representation.
+A real conversion is performed ONLY in case of JSON input. When input is a BLOB, it is assumed to be already properly formatted.
 
-Functions in the `vector_convert_` family should be used in all `INSERT`, `UPDATE`, and `DELETE` statements to properly format vector values. However, they are *not* required when specifying input vectors for the `vector_full_scan` or `vector_quantize_scan` virtual tables.
+Functions in the `vector_as_` family should be used in all `INSERT`, `UPDATE`, and `DELETE` statements to properly format vector values. However, they are *not* required when specifying input vectors for the `vector_full_scan` or `vector_quantize_scan` virtual tables.
 
 **Parameters:**
 
@@ -193,10 +194,10 @@ Functions in the `vector_convert_` family should be used in all `INSERT`, `UPDAT
 
 ```sql
 -- Insert a Float32 vector using JSON
-INSERT INTO documents(embedding) VALUES(vector_convert_f32('[0.1, 0.2, 0.3]'));
+INSERT INTO documents(embedding) VALUES(vector_as_f32('[0.1, 0.2, 0.3]'));
 
 -- Insert a UInt8 vector using raw BLOB (ensure correct formatting!)
-INSERT INTO compressed_vectors(embedding) VALUES(vector_convert_u8(X'010203'));
+INSERT INTO compressed_vectors(embedding) VALUES(vector_as_u8(X'010203'));
 ```
 
 ---
@@ -219,7 +220,7 @@ Performs a brute-force nearest neighbor search using the given vector. Despite i
 
 ```sql
 SELECT rowid, distance
-FROM vector_full_scan('documents', 'embedding', vector_convert_f32('[0.1, 0.2, 0.3]'), 5);
+FROM vector_full_scan('documents', 'embedding', vector_as_f32('[0.1, 0.2, 0.3]'), 5);
 ```
 
 ---
@@ -250,7 +251,7 @@ You **must run `vector_quantize()`** before using `vector_quantize_scan()` and w
 
 ```sql
 SELECT rowid, distance
-FROM vector_quantize_scan('documents', 'embedding', vector_convert_f32('[0.1, 0.2, 0.3]'), 10);
+FROM vector_quantize_scan('documents', 'embedding', vector_as_f32('[0.1, 0.2, 0.3]'), 10);
 ```
 
 ---

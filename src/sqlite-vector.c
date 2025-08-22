@@ -156,105 +156,6 @@ typedef int (*vcursor_sort_callback)(vFullScanCursor *c);
 extern distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX];
 extern char *distance_backend_name;
 
-// MARK: - FLOAT / BFLOAT16 -
-
-// there is a native bfloat16_t ARM intrinsic
-typedef uint16_t float16_t;
-typedef uint16_t bfloat16_t;
-
-static inline bfloat16_t float32_to_bfloat16 (float f) {
-    uint32_t bits = *(uint32_t *)&f;
-    return (bfloat16_t)(bits >> 16);
-}
-
-static inline float bfloat16_to_float32 (bfloat16_t bf) {
-    uint32_t bits = ((uint32_t)bf) << 16;
-    return *(float *)&bits;
-}
-
-// convert 16-bit float (IEEE-754 binary16) to 32-bit float
-static inline float float16_to_float32 (uint16_t h) {
-    uint16_t h_exp = (h & 0x7C00u);
-    uint16_t h_sig = (h & 0x03FFu);
-    uint32_t f_sgn = ((uint32_t)h & 0x8000u) << 16;
-
-    if (h_exp == 0x0000u) {
-        // Zero or subnormal
-        if (h_sig == 0) {
-            return *((float*)&f_sgn);  // ±0.0
-        } else {
-            // Normalize subnormal
-            float result = (float)(h_sig) / 1024.0f;
-            return *((float*)&f_sgn) ? -result : result;
-        }
-    } else if (h_exp == 0x7C00u) {
-        // Inf or NaN
-        uint32_t f_inf_nan = f_sgn | 0x7F800000u | ((uint32_t)(h_sig) << 13);
-        return *((float*)&f_inf_nan);
-    }
-
-    // Normalized number
-    uint32_t f_exp = ((uint32_t)(h_exp >> 10) + (127 - 15)) << 23;
-    uint32_t f_sig = ((uint32_t)h_sig) << 13;
-    uint32_t f = f_sgn | f_exp | f_sig;
-
-    float result;
-    *((uint32_t*)&result) = f;
-    return result;
-}
-
-// convert 32-bit float to 16-bit float (IEEE-754 binary16), result stored as uint16_t
-static inline uint16_t float32_to_float16(float f) {
-    union {
-        uint32_t u;
-        float f;
-    } v;
-    v.f = f;
-
-    uint32_t f_bits = v.u;
-
-    uint32_t sign = (f_bits >> 16) & 0x8000;
-    int32_t  exp  = ((f_bits >> 23) & 0xFF) - 127 + 15;
-    uint32_t frac = f_bits & 0x007FFFFF;
-
-    if (exp <= 0) {
-        // Subnormal or underflow
-        if (exp < -10) {
-            // Too small for subnormal — flush to zero
-            return (uint16_t)sign;
-        }
-        // Subnormal
-        frac |= 0x00800000; // add implicit leading 1
-        int shift = 14 - exp;
-        uint16_t subnormal = (uint16_t)(frac >> shift);
-        // Round to nearest
-        if ((frac >> (shift - 1)) & 1) subnormal += 1;
-        return sign | subnormal;
-    } else if (exp >= 31) {
-        // Overflow → Inf or NaN
-        if (frac == 0) {
-            return (uint16_t)(sign | 0x7C00); // Inf
-        } else {
-            return (uint16_t)(sign | 0x7C00 | (frac >> 13)); // NaN
-        }
-    }
-
-    // Normal range: round and pack
-    uint16_t h_exp = (uint16_t)(exp << 10);
-    uint16_t h_frac = (uint16_t)(frac >> 13);
-    // Round to nearest
-    if (frac & 0x00001000) {
-        h_frac += 1;
-        if (h_frac == 0x0400) {  // mantissa overflow
-            h_frac = 0;
-            h_exp += 0x0400;
-            if (h_exp >= 0x7C00) h_exp = 0x7C00; // clamp to Inf
-        }
-    }
-
-    return (uint16_t)(sign | h_exp | h_frac);
-}
-
 // MARK: - SQLite Utils -
 
 bool sqlite_system_exists (sqlite3 *db, const char *name, const char *type) {
@@ -621,7 +522,7 @@ static size_t vector_type_to_size (vector_type type) {
     switch (type) {
         case VECTOR_TYPE_F32: return sizeof(float);
         case VECTOR_TYPE_F16: return sizeof(uint16_t);
-        case VECTOR_TYPE_BF16: return sizeof(bfloat16_t);
+        case VECTOR_TYPE_BF16: return sizeof(uint16_t);
         case VECTOR_TYPE_U8: return sizeof(uint8_t);
         case VECTOR_TYPE_I8: return sizeof(int8_t);
     }
@@ -1324,7 +1225,7 @@ static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **
 
 // MARK: -
 
-static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vector_type type, const char *json, int *size, int dimension) {
+static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vector_type type, const char *json, int *size, int dimension) {
     char *blob = NULL;
     
     // skip leading whitespace
@@ -1356,7 +1257,7 @@ static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *v
     uint8_t    *uint8_blob    = (uint8_t *)blob;
     int8_t     *int8_blob     = (int8_t *)blob;
     uint16_t   *uint16_blob   = (uint16_t *)blob;
-    bfloat16_t *bfloat16_blob = (bfloat16_t *)blob;
+    uint16_t   *bfloat16_blob = (uint16_t *)blob;
     
     int count = 0;
     const char *p = json;
@@ -1390,7 +1291,7 @@ static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *v
                 break;
                 
             case VECTOR_TYPE_F16:
-                uint16_blob[count++] = fp16_ieee_from_fp32_value((float)value);
+                uint16_blob[count++] = float32_to_float16((float)value);
                 break;
 
             case VECTOR_TYPE_BF16:
@@ -1451,7 +1352,7 @@ static void *vector_convert_from_json (sqlite3_context *context, sqlite3_vtab *v
     return blob;
 }
 
-static void vector_convert (sqlite3_context *context, vector_type type, int argc, sqlite3_value **argv) {
+static void vector_as_type (sqlite3_context *context, vector_type type, int argc, sqlite3_value **argv) {
     sqlite3_value *value = argv[0];
     int value_size = sqlite3_value_bytes(value);
     int value_type = sqlite3_value_type(value);
@@ -1485,7 +1386,7 @@ static void vector_convert (sqlite3_context *context, vector_type type, int argc
             return;
         }
         
-        char *blob = vector_convert_from_json(context, NULL, type, json, &value_size, dimension);
+        char *blob = vector_from_json(context, NULL, type, json, &value_size, dimension);
         if (!blob) return; // error is set in the context
         
         sqlite3_result_blob(context, (const void *)blob, value_size, sqlite3_free);
@@ -1495,24 +1396,24 @@ static void vector_convert (sqlite3_context *context, vector_type type, int argc
     context_result_error(context, SQLITE_ERROR, "Unsupported input type: only BLOB and TEXT values are accepted (received %s).", sqlite_type_name(value_type));
 }
 
-static void vector_convert_f32 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_F32, argc, argv);
+static void vector_as_f32 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    vector_as_type(context, VECTOR_TYPE_F32, argc, argv);
 }
 
-static void vector_convert_f16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_F16, argc, argv);
+static void vector_as_f16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    vector_as_type(context, VECTOR_TYPE_F16, argc, argv);
 }
 
-static void vector_convert_bf16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_BF16, argc, argv);
+static void vector_as_bf16 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    vector_as_type(context, VECTOR_TYPE_BF16, argc, argv);
 }
 
-static void vector_convert_u8 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_U8, argc, argv);
+static void vector_as_u8 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    vector_as_type(context, VECTOR_TYPE_U8, argc, argv);
 }
 
-static void vector_convert_i8 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    vector_convert(context, VECTOR_TYPE_I8, argc, argv);
+static void vector_as_i8 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    vector_as_type(context, VECTOR_TYPE_I8, argc, argv);
 }
 
 // MARK: - Modules -
@@ -1559,8 +1460,8 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     int vsize = 0;
     if (sqlite3_value_type(argv[2]) == SQLITE_TEXT) {
         vsize = sqlite3_value_bytes(argv[2]);
-        vector = (const void *)vector_convert_from_json(NULL, &vtab->base, t_ctx->options.v_type, (const char *)sqlite3_value_text(argv[2]), &vsize, t_ctx->options.v_dim);
-        if (!vector) return SQLITE_ERROR; // error already set inside vector_convert_from_json
+        vector = (const void *)vector_from_json(NULL, &vtab->base, t_ctx->options.v_type, (const char *)sqlite3_value_text(argv[2]), &vsize, t_ctx->options.v_dim);
+        if (!vector) return SQLITE_ERROR; // error already set inside vector_from_json
     } else {
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
@@ -2089,24 +1990,24 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     rc = sqlite3_create_function(db, "vector_cleanup", 2, SQLITE_UTF8, ctx, vector_cleanup, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
-    rc = sqlite3_create_function(db, "vector_convert_f32", 1, SQLITE_UTF8, ctx, vector_convert_f32, NULL, NULL);
-    rc = sqlite3_create_function(db, "vector_convert_f32", 2, SQLITE_UTF8, ctx, vector_convert_f32, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_f32", 1, SQLITE_UTF8, ctx, vector_as_f32, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_f32", 2, SQLITE_UTF8, ctx, vector_as_f32, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
-    rc = sqlite3_create_function(db, "vector_convert_f16", 1, SQLITE_UTF8, ctx, vector_convert_f16, NULL, NULL);
-    rc = sqlite3_create_function(db, "vector_convert_f16", 2, SQLITE_UTF8, ctx, vector_convert_f16, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_f16", 1, SQLITE_UTF8, ctx, vector_as_f16, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_f16", 2, SQLITE_UTF8, ctx, vector_as_f16, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
-    rc = sqlite3_create_function(db, "vector_convert_bf16", 1, SQLITE_UTF8, ctx, vector_convert_bf16, NULL, NULL);
-    rc = sqlite3_create_function(db, "vector_convert_bf16", 2, SQLITE_UTF8, ctx, vector_convert_bf16, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_bf16", 1, SQLITE_UTF8, ctx, vector_as_bf16, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_bf16", 2, SQLITE_UTF8, ctx, vector_as_bf16, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
-    rc = sqlite3_create_function(db, "vector_convert_i8", 1, SQLITE_UTF8, ctx, vector_convert_i8, NULL, NULL);
-    rc = sqlite3_create_function(db, "vector_convert_i8", 2, SQLITE_UTF8, ctx, vector_convert_i8, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_i8", 1, SQLITE_UTF8, ctx, vector_as_i8, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_i8", 2, SQLITE_UTF8, ctx, vector_as_i8, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
-    rc = sqlite3_create_function(db, "vector_convert_u8", 1, SQLITE_UTF8, ctx, vector_convert_u8, NULL, NULL);
-    rc = sqlite3_create_function(db, "vector_convert_u8", 2, SQLITE_UTF8, ctx, vector_convert_u8, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_u8", 1, SQLITE_UTF8, ctx, vector_as_u8, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_as_u8", 2, SQLITE_UTF8, ctx, vector_as_u8, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_module(db, "vector_full_scan", &vFullScanModule, ctx);

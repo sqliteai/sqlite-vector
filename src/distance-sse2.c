@@ -30,6 +30,37 @@ extern char *distance_backend_name;
 #define SIGN_EXTEND_EPI16_TO_EPI32_HI(v) \
     _mm_srai_epi32(_mm_unpackhi_epi16(_mm_slli_epi32((v), 16), (v)), 16)
 
+static inline double hsum128d(__m128d v) {
+    __m128d sh = _mm_unpackhi_pd(v, v);
+    __m128d s  = _mm_add_sd(v, sh);
+    return _mm_cvtsd_f64(s);
+}
+
+static inline __m128d mm_abs_pd(__m128d x) {
+    const __m128d sign = _mm_set1_pd(-0.0);
+    return _mm_andnot_pd(sign, x);
+}
+
+static inline __m128 f16x4_to_f32x4_loadu(const uint16_t* p) {
+    float tmp[4];
+    tmp[0] = float16_to_float32(p[0]);
+    tmp[1] = float16_to_float32(p[1]);
+    tmp[2] = float16_to_float32(p[2]);
+    tmp[3] = float16_to_float32(p[3]);
+    return _mm_loadu_ps(tmp);
+}
+
+/* load 4 bf16 -> __m128 of f32 */
+static inline __m128 bf16x4_to_f32x4_loadu(const uint16_t* p) {
+    float tmp[4];
+    tmp[0] = bfloat16_to_float32(p[0]);
+    tmp[1] = bfloat16_to_float32(p[1]);
+    tmp[2] = bfloat16_to_float32(p[2]);
+    tmp[3] = bfloat16_to_float32(p[3]);
+    return _mm_loadu_ps(tmp);
+}
+
+
 // MARK: - FLOAT32 -
 
 static inline float float32_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
@@ -157,6 +188,386 @@ float float32_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
     return 1.0f - cosine_sim;
 }
 
+// MARK: - FLOAT16 -
+
+static inline float float16_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+    const uint16_t *a = (const uint16_t *)v1;
+    const uint16_t *b = (const uint16_t *)v2;
+
+    __m128d acc0 = _mm_setzero_pd();
+    __m128d acc1 = _mm_setzero_pd();
+    int i = 0;
+
+    for (; i <= n - 4; i += 4) {
+        /* Inf mismatch? (a_inf ^ b_inf) || (both inf with different signs) */
+        for (int k=0;k<4;++k) {
+            uint16_t ak=a[i+k], bk=b[i+k];
+            bool ai=f16_is_inf(ak), bi=f16_is_inf(bk);
+            if ((ai ^ bi) || (ai && bi && (f16_sign(ak) != f16_sign(bk))))
+                return INFINITY;
+        }
+
+        __m128 af = f16x4_to_f32x4_loadu(a + i);
+        __m128 bf = f16x4_to_f32x4_loadu(b + i);
+
+        /* widen to f64 and subtract in f64 to avoid f32 overflow */
+        __m128d a_lo = _mm_cvtps_pd(af);
+        __m128d b_lo = _mm_cvtps_pd(bf);
+        __m128  af_hi4 = _mm_movehl_ps(af, af);  /* [a3 a2 .. ..] */
+        __m128  bf_hi4 = _mm_movehl_ps(bf, bf);
+        __m128d a_hi = _mm_cvtps_pd(af_hi4);
+        __m128d b_hi = _mm_cvtps_pd(bf_hi4);
+
+        __m128d d0 = _mm_sub_pd(a_lo, b_lo);
+        __m128d d1 = _mm_sub_pd(a_hi, b_hi);
+
+        /* zero-out NaNs: m = (d==d) */
+        __m128d m0 = _mm_cmpeq_pd(d0, d0);
+        __m128d m1 = _mm_cmpeq_pd(d1, d1);
+        d0 = _mm_and_pd(d0, m0);
+        d1 = _mm_and_pd(d1, m1);
+
+        acc0 = _mm_add_pd(acc0, _mm_mul_pd(d0, d0));
+        acc1 = _mm_add_pd(acc1, _mm_mul_pd(d1, d1));
+    }
+
+    double sum = hsum128d(acc0) + hsum128d(acc1);
+
+    /* tail */
+    for (; i < n; ++i) {
+        uint16_t ai=a[i], bi=b[i];
+        if ((f16_is_inf(ai) || f16_is_inf(bi)) &&
+            !(f16_is_inf(ai) && f16_is_inf(bi) && f16_sign(ai)==f16_sign(bi)))
+            return INFINITY;
+        if (f16_is_nan(ai) || f16_is_nan(bi)) continue;
+        double d = (double)float16_to_float32(ai) - (double)float16_to_float32(bi);
+        sum = fma(d, d, sum);
+    }
+
+    return use_sqrt ? (float)sqrt(sum) : (float)sum;
+}
+float float16_distance_l2_sse2 (const void *v1, const void *v2, int n) {
+    return float16_distance_l2_impl_sse2(v1, v2, n, true);
+}
+
+float float16_distance_l2_squared_sse2 (const void *v1, const void *v2, int n) {
+    return float16_distance_l2_impl_sse2(v1, v2, n, false);
+}
+
+float float16_distance_l1_sse2 (const void *v1, const void *v2, int n) {
+    const uint16_t *a = (const uint16_t *)v1;
+    const uint16_t *b = (const uint16_t *)v2;
+
+    __m128d acc = _mm_setzero_pd();
+    int i = 0;
+
+    for (; i <= n - 4; i += 4) {
+        for (int k=0;k<4;++k) {
+            uint16_t ak=a[i+k], bk=b[i+k];
+            bool ai=f16_is_inf(ak), bi=f16_is_inf(bk);
+            if ((ai ^ bi) || (ai && bi && (f16_sign(ak) != f16_sign(bk))))
+                return INFINITY;
+        }
+
+        __m128 af = f16x4_to_f32x4_loadu(a + i);
+        __m128 bf = f16x4_to_f32x4_loadu(b + i);
+
+        __m128d a_lo = _mm_cvtps_pd(af);
+        __m128d b_lo = _mm_cvtps_pd(bf);
+        __m128  af_hi4 = _mm_movehl_ps(af, af);
+        __m128  bf_hi4 = _mm_movehl_ps(bf, bf);
+        __m128d a_hi = _mm_cvtps_pd(af_hi4);
+        __m128d b_hi = _mm_cvtps_pd(bf_hi4);
+
+        __m128d d0 = mm_abs_pd(_mm_sub_pd(a_lo, b_lo));
+        __m128d d1 = mm_abs_pd(_mm_sub_pd(a_hi, b_hi));
+
+        __m128d m0 = _mm_cmpeq_pd(d0, d0);
+        __m128d m1 = _mm_cmpeq_pd(d1, d1);
+        d0 = _mm_and_pd(d0, m0);
+        d1 = _mm_and_pd(d1, m1);
+
+        acc = _mm_add_pd(acc, d0);
+        acc = _mm_add_pd(acc, d1);
+    }
+
+    double sum = hsum128d(acc);
+
+    for (; i < n; ++i) {
+        uint16_t ai=a[i], bi=b[i];
+        if ((f16_is_inf(ai) || f16_is_inf(bi)) &&
+            !(f16_is_inf(ai) && f16_is_inf(bi) && f16_sign(ai)==f16_sign(bi)))
+            return INFINITY;
+        if (f16_is_nan(ai) || f16_is_nan(bi)) continue;
+        sum += fabs((double)float16_to_float32(ai) - (double)float16_to_float32(bi));
+    }
+
+    return (float)sum;
+}
+
+float float16_distance_dot_sse2 (const void *v1, const void *v2, int n) {
+    const uint16_t *a = (const uint16_t *)v1;
+    const uint16_t *b = (const uint16_t *)v2;
+
+    __m128d acc0 = _mm_setzero_pd();
+    __m128d acc1 = _mm_setzero_pd();
+    int i = 0;
+
+    for (; i <= n - 4; i += 4) {
+        /* Handle Inf*X lanes up-front for correct ±Inf sign */
+        for (int k=0;k<4;++k) {
+            uint16_t ak=a[i+k], bk=b[i+k];
+            bool ai=f16_is_inf(ak), bi=f16_is_inf(bk);
+            if (ai || bi) {
+                if ((ai && f16_is_zero(bk)) || (bi && f16_is_zero(ak))) {
+                    /* Inf * 0 => NaN: ignore lane */
+                } else {
+                    int s = (f16_sign(ak) ^ f16_sign(bk)) ? -1 : +1;
+                    return s < 0 ? INFINITY : -INFINITY; /* function returns -dot */
+                }
+            }
+        }
+
+        __m128 af = f16x4_to_f32x4_loadu(a + i);
+        __m128 bf = f16x4_to_f32x4_loadu(b + i);
+
+        /* zero-out NaNs */
+        __m128 mask_a = _mm_cmpeq_ps(af, af);
+        __m128 mask_b = _mm_cmpeq_ps(bf, bf);
+        af = _mm_and_ps(af, mask_a);
+        bf = _mm_and_ps(bf, mask_b);
+
+        /* widen and accumulate in f64 */
+        __m128d a_lo = _mm_cvtps_pd(af);
+        __m128d b_lo = _mm_cvtps_pd(bf);
+        __m128  af_hi4 = _mm_movehl_ps(af, af);
+        __m128  bf_hi4 = _mm_movehl_ps(bf, bf);
+        __m128d a_hi = _mm_cvtps_pd(af_hi4);
+        __m128d b_hi = _mm_cvtps_pd(bf_hi4);
+
+        acc0 = _mm_add_pd(acc0, _mm_mul_pd(a_lo, b_lo));
+        acc1 = _mm_add_pd(acc1, _mm_mul_pd(a_hi, b_hi));
+    }
+
+    double dot = hsum128d(acc0) + hsum128d(acc1);
+
+    for (; i < n; ++i) {
+        uint16_t ai=a[i], bi=b[i];
+        if (f16_is_nan(ai) || f16_is_nan(bi)) continue;
+        bool aiinf=f16_is_inf(ai), biinf=f16_is_inf(bi);
+        if (aiinf || biinf) {
+            if ((aiinf && f16_is_zero(bi)) || (biinf && f16_is_zero(ai))) {
+                /* Inf*0 -> NaN: ignore */
+            } else {
+                int s = (f16_sign(ai) ^ f16_sign(bi)) ? -1 : +1;
+                return s < 0 ? INFINITY : -INFINITY; /* returns -dot */
+            }
+        } else {
+            dot += (double)float16_to_float32(ai) * (double)float16_to_float32(bi);
+        }
+    }
+
+    return (float)(-dot);
+}
+
+float float16_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
+    float dot    = -float16_distance_dot_sse2(v1, v2, n);
+    float norm_a =  sqrtf(-float16_distance_dot_sse2(v1, v1, n));
+    float norm_b =  sqrtf(-float16_distance_dot_sse2(v2, v2, n));
+    if (!(norm_a > 0.0f) || !(norm_b > 0.0f) || !isfinite(norm_a) || !isfinite(norm_b) || !isfinite(dot))
+        return 1.0f;
+    float cs = dot / (norm_a * norm_b);
+    if (cs > 1.0f) cs = 1.0f; else if (cs < -1.0f) cs = -1.0f;
+    return 1.0f - cs;
+}
+
+// MARK: - BFLOAT16 -
+
+static inline float bfloat16_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
+    const uint16_t *a = (const uint16_t *)v1;
+    const uint16_t *b = (const uint16_t *)v2;
+
+    __m128d acc0 = _mm_setzero_pd();
+    __m128d acc1 = _mm_setzero_pd();
+    int i = 0;
+
+    for (; i <= n - 4; i += 4) {
+        for (int k=0;k<4;++k) {
+            uint16_t ak=a[i+k], bk=b[i+k];
+            bool ai=bfloat16_is_inf(ak), bi=bfloat16_is_inf(bk);
+            if ((ai ^ bi) || (ai && bi && (bfloat16_sign(ak) != bfloat16_sign(bk))))
+                return INFINITY;
+        }
+
+        __m128 af = bf16x4_to_f32x4_loadu(a + i);
+        __m128 bf = bf16x4_to_f32x4_loadu(b + i);
+
+        __m128d a_lo = _mm_cvtps_pd(af);
+        __m128d b_lo = _mm_cvtps_pd(bf);
+        __m128  af_hi4 = _mm_movehl_ps(af, af);
+        __m128  bf_hi4 = _mm_movehl_ps(bf, bf);
+        __m128d a_hi = _mm_cvtps_pd(af_hi4);
+        __m128d b_hi = _mm_cvtps_pd(bf_hi4);
+
+        __m128d d0 = _mm_sub_pd(a_lo, b_lo);
+        __m128d d1 = _mm_sub_pd(a_hi, b_hi);
+
+        __m128d m0 = _mm_cmpeq_pd(d0, d0);
+        __m128d m1 = _mm_cmpeq_pd(d1, d1);
+        d0 = _mm_and_pd(d0, m0);
+        d1 = _mm_and_pd(d1, m1);
+
+        acc0 = _mm_add_pd(acc0, _mm_mul_pd(d0, d0));
+        acc1 = _mm_add_pd(acc1, _mm_mul_pd(d1, d1));
+    }
+
+    double sum = hsum128d(acc0) + hsum128d(acc1);
+
+    for (; i < n; ++i) {
+        uint16_t ai=a[i], bi=b[i];
+        if ((bfloat16_is_inf(ai) || bfloat16_is_inf(bi)) &&
+            !(bfloat16_is_inf(ai) && bfloat16_is_inf(bi) && bfloat16_sign(ai)==bfloat16_sign(bi)))
+            return INFINITY;
+        if (bfloat16_is_nan(ai) || bfloat16_is_nan(bi)) continue;
+        double d = (double)bfloat16_to_float32(ai) - (double)bfloat16_to_float32(bi);
+        sum = fma(d, d, sum);
+    }
+
+    return use_sqrt ? (float)sqrt(sum) : (float)sum;
+}
+float bfloat16_distance_l2_sse2 (const void *v1, const void *v2, int n) {
+    return bfloat16_distance_l2_impl_sse2(v1, v2, n, true);
+}
+
+float bfloat16_distance_l2_squared_sse2 (const void *v1, const void *v2, int n) {
+    return bfloat16_distance_l2_impl_sse2(v1, v2, n, false);
+}
+
+float bfloat16_distance_l1_sse2 (const void *v1, const void *v2, int n) {
+    const uint16_t *a = (const uint16_t *)v1;
+    const uint16_t *b = (const uint16_t *)v2;
+
+    __m128d acc = _mm_setzero_pd();
+    int i = 0;
+
+    for (; i <= n - 4; i += 4) {
+        for (int k=0;k<4;++k) {
+            uint16_t ak=a[i+k], bk=b[i+k];
+            bool ai=bfloat16_is_inf(ak), bi=bfloat16_is_inf(bk);
+            if ((ai ^ bi) || (ai && bi && (bfloat16_sign(ak) != bfloat16_sign(bk))))
+                return INFINITY;
+        }
+
+        __m128 af = bf16x4_to_f32x4_loadu(a + i);
+        __m128 bf = bf16x4_to_f32x4_loadu(b + i);
+
+        __m128d a_lo = _mm_cvtps_pd(af);
+        __m128d b_lo = _mm_cvtps_pd(bf);
+        __m128  af_hi4 = _mm_movehl_ps(af, af);
+        __m128  bf_hi4 = _mm_movehl_ps(bf, bf);
+        __m128d a_hi = _mm_cvtps_pd(af_hi4);
+        __m128d b_hi = _mm_cvtps_pd(bf_hi4);
+
+        __m128d d0 = mm_abs_pd(_mm_sub_pd(a_lo, b_lo));
+        __m128d d1 = mm_abs_pd(_mm_sub_pd(a_hi, b_hi));
+
+        __m128d m0 = _mm_cmpeq_pd(d0, d0);
+        __m128d m1 = _mm_cmpeq_pd(d1, d1);
+        d0 = _mm_and_pd(d0, m0);
+        d1 = _mm_and_pd(d1, m1);
+
+        acc = _mm_add_pd(acc, d0);
+        acc = _mm_add_pd(acc, d1);
+    }
+
+    double sum = hsum128d(acc);
+
+    for (; i < n; ++i) {
+        uint16_t ai=a[i], bi=b[i];
+        if ((bfloat16_is_inf(ai) || bfloat16_is_inf(bi)) &&
+            !(bfloat16_is_inf(ai) && bfloat16_is_inf(bi) && bfloat16_sign(ai)==bfloat16_sign(bi)))
+            return INFINITY;
+        if (bfloat16_is_nan(ai) || bfloat16_is_nan(bi)) continue;
+        sum += fabs((double)bfloat16_to_float32(ai) - (double)bfloat16_to_float32(bi));
+    }
+
+    return (float)sum;
+}
+
+float bfloat16_distance_dot_sse2 (const void *v1, const void *v2, int n) {
+    const uint16_t *a = (const uint16_t *)v1;
+    const uint16_t *b = (const uint16_t *)v2;
+
+    __m128d acc0 = _mm_setzero_pd();
+    __m128d acc1 = _mm_setzero_pd();
+    int i = 0;
+
+    for (; i <= n - 4; i += 4) {
+        /* handle Inf*X per-lane for correct sign */
+        for (int k=0;k<4;++k){
+            uint16_t ak=a[i+k], bk=b[i+k];
+            bool ai=bfloat16_is_inf(ak), bi=bfloat16_is_inf(bk);
+            if (ai || bi) {
+                if ((ai && bfloat16_is_zero(bk)) || (bi && bfloat16_is_zero(ak))) {
+                    /* Inf*0 -> NaN: ignore lane */
+                } else {
+                    int s = (bfloat16_sign(ak) ^ bfloat16_sign(bk)) ? -1 : +1;
+                    return s < 0 ? INFINITY : -INFINITY;  /* function returns -dot */
+                }
+            }
+        }
+
+        __m128 af = bf16x4_to_f32x4_loadu(a + i);
+        __m128 bf = bf16x4_to_f32x4_loadu(b + i);
+
+        /* zero NaNs */
+        __m128 ma = _mm_cmpeq_ps(af, af);
+        __m128 mb = _mm_cmpeq_ps(bf, bf);
+        af = _mm_and_ps(af, ma);
+        bf = _mm_and_ps(bf, mb);
+
+        /* widen and accumulate in f64 */
+        __m128d a_lo = _mm_cvtps_pd(af);
+        __m128d b_lo = _mm_cvtps_pd(bf);
+        __m128  af_hi4 = _mm_movehl_ps(af, af);
+        __m128  bf_hi4 = _mm_movehl_ps(bf, bf);
+        __m128d a_hi = _mm_cvtps_pd(af_hi4);
+        __m128d b_hi = _mm_cvtps_pd(bf_hi4);
+
+        acc0 = _mm_add_pd(acc0, _mm_mul_pd(a_lo, b_lo));
+        acc1 = _mm_add_pd(acc1, _mm_mul_pd(a_hi, b_hi));
+    }
+
+    double dot = hsum128d(acc0) + hsum128d(acc1);
+
+    for (; i < n; ++i) {
+        uint16_t ai=a[i], bi=b[i];
+        if (bfloat16_is_nan(ai) || bfloat16_is_nan(bi)) continue;
+        bool aiinf=bfloat16_is_inf(ai), biinf=bfloat16_is_inf(bi);
+        if (aiinf || biinf) {
+            if ((aiinf && bfloat16_is_zero(bi)) || (biinf && bfloat16_is_zero(ai))) {
+                /* Inf*0 -> NaN: ignore */
+            } else {
+                int s = (bfloat16_sign(ai) ^ bfloat16_sign(bi)) ? -1 : +1;
+                return s < 0 ? INFINITY : -INFINITY;  /* returns -dot */
+            }
+        } else {
+            dot += (double)bfloat16_to_float32(ai) * (double)bfloat16_to_float32(bi);
+        }
+    }
+
+    return (float)(-dot);
+}
+
+float bfloat16_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
+    float dot    = -bfloat16_distance_dot_sse2(v1, v2, n);
+    float norm_a =  sqrtf(-bfloat16_distance_dot_sse2(v1, v1, n));
+    float norm_b =  sqrtf(-bfloat16_distance_dot_sse2(v2, v2, n));
+    if (!(norm_a > 0.0f) || !(norm_b > 0.0f) || !isfinite(norm_a) || !isfinite(norm_b) || !isfinite(dot)) return 1.0f;
+    float cs = dot / (norm_a * norm_b);
+    if (cs > 1.0f) cs = 1.0f; else if (cs < -1.0f) cs = -1.0f;
+    return 1.0f - cs;
+}
 
 // MARK: - UINT8 -
 
@@ -602,22 +1013,32 @@ float int8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
 void init_distance_functions_sse2 (void) {
 #if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (_M_IX86_FP >= 2)))
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F32] = float32_distance_l2_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F16] = float16_distance_l2_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_BF16] = bfloat16_distance_l2_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_U8] = uint8_distance_l2_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_I8] = int8_distance_l2_sse2;
     
     dispatch_distance_table[VECTOR_DISTANCE_SQUARED_L2][VECTOR_TYPE_F32] = float32_distance_l2_squared_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_SQUARED_L2][VECTOR_TYPE_F16] = float16_distance_l2_squared_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_SQUARED_L2][VECTOR_TYPE_BF16] = bfloat16_distance_l2_squared_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_SQUARED_L2][VECTOR_TYPE_U8] = uint8_distance_l2_squared_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_SQUARED_L2][VECTOR_TYPE_I8] = int8_distance_l2_squared_sse2;
     
     dispatch_distance_table[VECTOR_DISTANCE_COSINE][VECTOR_TYPE_F32] = float32_distance_cosine_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_COSINE][VECTOR_TYPE_F16] = float16_distance_cosine_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_COSINE][VECTOR_TYPE_BF16] = bfloat16_distance_cosine_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_COSINE][VECTOR_TYPE_U8] = uint8_distance_cosine_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_COSINE][VECTOR_TYPE_I8] = int8_distance_cosine_sse2;
     
     dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_F32] = float32_distance_dot_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_F16] = float16_distance_dot_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_BF16] = bfloat16_distance_dot_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_U8] = uint8_distance_dot_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_I8] = int8_distance_dot_sse2;
     
     dispatch_distance_table[VECTOR_DISTANCE_L1][VECTOR_TYPE_F32] = float32_distance_l1_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_L1][VECTOR_TYPE_F16] = float16_distance_l1_sse2;
+    dispatch_distance_table[VECTOR_DISTANCE_L1][VECTOR_TYPE_BF16] = bfloat16_distance_l1_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_L1][VECTOR_TYPE_U8] = uint8_distance_l1_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_L1][VECTOR_TYPE_I8] = int8_distance_l1_sse2;
     

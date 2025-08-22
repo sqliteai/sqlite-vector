@@ -66,7 +66,7 @@ CREATE TABLE images (
 INSERT INTO images (embedding, label) VALUES (?, 'cat');
 
 -- Insert a JSON vector (Float32, 384 dimensions)
-INSERT INTO images (embedding, label) VALUES (vector_convert_f32('[0.3, 1.0, 0.9, 3.2, 1.4,...]'), 'dog');
+INSERT INTO images (embedding, label) VALUES (vector_as_f32('[0.3, 1.0, 0.9, 3.2, 1.4,...]'), 'dog');
 
 -- Initialize the vector. By default, the distance function is L2.
 -- To use a different metric, specify one of the following options:

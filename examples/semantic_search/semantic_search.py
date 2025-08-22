@@ -124,7 +124,7 @@ class SemanticSearch:
             embedding_json = json.dumps(embedding.tolist())
 
             cursor.execute(
-                "INSERT INTO documents (filepath, content, embedding) VALUES (?, ?, vector_convert_f32(?))",
+                "INSERT INTO documents (filepath, content, embedding) VALUES (?, ?, vector_as_f32(?))",
                 (filepath, chunk, embedding_json)
             )
             chunk_count += 1
@@ -168,7 +168,7 @@ class SemanticSearch:
         cursor.execute("""
             SELECT d.id, d.filepath, d.content, v.distance
             FROM documents AS d
-                JOIN vector_quantize_scan('documents', 'embedding', vector_convert_f32(?), ?) AS v
+                JOIN vector_quantize_scan('documents', 'embedding', vector_as_f32(?), ?) AS v
                 ON d.id = v.rowid;
         """, (query_json, limit))
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
