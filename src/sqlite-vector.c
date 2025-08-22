@@ -1471,7 +1471,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         char buffer[STATIC_SQL_SIZE];
         char *name = generate_quant_table_name(table_name, column_name, buffer);
         if (!name || !sqlite_table_exists(vtab->db, name)) {
-            sqlite_vtab_set_error(&vtab->base, "Quantization table not found for table '%s' and column '%s'. Ensure that vector_quantize() has been called before using vector_quantize_scan().");
+            sqlite_vtab_set_error(&vtab->base, "Quantization table not found for table '%s' and column '%s'. Ensure that vector_quantize() has been called before using vector_quantize_scan().", table_name, column_name);
             return SQLITE_ERROR;
         }
     }
