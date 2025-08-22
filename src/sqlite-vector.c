@@ -1899,11 +1899,6 @@ static void vector_init (sqlite3_context *context, int argc, sqlite3_value **arg
         return;
     }
     
-    if ((options.v_type == VECTOR_TYPE_F16) || (options.v_type == VECTOR_TYPE_BF16)) {
-        context_result_error(context, SQLITE_ERROR, "FLOAT16 and FLOATB16 vector types are currently under development. Please update to the latest version.");
-        return;
-    }
-    
     // check if table is already loaded
     vector_context *v_ctx = (vector_context *)sqlite3_user_data(context);
     table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
