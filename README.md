@@ -2,15 +2,15 @@
 
 **SQLite Vector** is a cross-platform, ultra-efficient SQLite extension that brings vector search capabilities to your embedded database. It works seamlessly on **iOS, Android, Windows, Linux, and macOS**, using just **30MB of memory** by default. With support for **Float32, Float16, BFloat16, Int8, and UInt8**, and **highly optimized distance functions**, it's the ideal solution for **Edge AI** applications.
 
-## 🚀 Highlights
+## Highlights
 
-* ✅ **No virtual tables required** – store vectors directly as `BLOB`s in ordinary tables
-* ✅ **Blazing fast** – optimized C implementation with SIMD acceleration
-* ✅ **Low memory footprint** – defaults to just 30MB of RAM usage
-* ✅ **Zero preindexing needed** – no long preprocessing or index-building phases
-* ✅ **Works offline** – perfect for on-device, privacy-preserving AI workloads
-* ✅ **Plug-and-play** – drop into existing SQLite workflows with minimal effort
-* ✅ **Cross-platform** – works out of the box on all major OSes
+* **No virtual tables required** – store vectors directly as `BLOB`s in ordinary tables
+* **Blazing fast** – optimized C implementation with SIMD acceleration
+* **Low memory footprint** – defaults to just 30MB of RAM usage
+* **Zero preindexing needed** – no long preprocessing or index-building phases
+* **Works offline** – perfect for on-device, privacy-preserving AI workloads
+* **Plug-and-play** – drop into existing SQLite workflows with minimal effort
+* **Cross-platform** – works out of the box on all major OSes
 
 
 ## Why Use SQLite-Vector?
@@ -28,7 +28,7 @@
 Unlike other vector databases or extensions that require complex setup, SQLite-Vector **just works** with your existing database schema and tools.
 
 
-## 📦 Installation
+## Installation
 
 ### Pre-built Binaries
 
@@ -85,13 +85,13 @@ SELECT e.id, v.distance FROM images AS e
    ON e.id = v.rowid;
 ```
 
-## 📋 Documentation
+## Documentation
 
 Extensive API documentation can be found in the [API page](https://github.com/sqliteai/sqlite-vector/blob/main/API.md).
 
 More information about the quantization process can be found in the [QUANTIZATION document](https://github.com/sqliteai/sqlite-vector/blob/main/QUANTIZATION.md).
 
-## 🧩 Features
+## Features
 
 ### Instant Vector Search – No Preindexing Required
 
@@ -99,10 +99,10 @@ Unlike other SQLite vector extensions that rely on complex indexing algorithms s
 
 This means:
 
-* 🕒 **No waiting time** before your app or service is usable
-* 🔄 **Zero-cost updates** – you can add, remove, or modify vectors on the fly without rebuilding any index
-* ⚡ **Works directly with BLOB columns** in ordinary SQLite tables – no special schema or virtual table required
-* 🌍 **Ideal for edge and mobile use cases**, where preprocessing large datasets is not practical or possible
+* **No waiting time** before your app or service is usable
+* **Zero-cost updates** – you can add, remove, or modify vectors on the fly without rebuilding any index
+* **Works directly with BLOB columns** in ordinary SQLite tables – no special schema or virtual table required
+* **Ideal for edge and mobile use cases**, where preprocessing large datasets is not practical or possible
 
 By eliminating the need for heavyweight indexing, `sqlite-vector` offers a **simpler, faster, and more developer-friendly** approach to embedding vector search in your applications.
 
@@ -133,7 +133,7 @@ These are implemented in pure C and optimized for SIMD when available, ensuring 
 
 ---
 
-# 🧠 What Is Vector Search?
+# What Is Vector Search?
 
 Vector search is the process of finding the closest match(es) to a given vector (a point in high-dimensional space) based on a similarity or distance metric. It is essential for AI and machine learning applications where data is often encoded into vector embeddings.
 
@@ -148,18 +148,18 @@ Vector search is the process of finding the closest match(es) to a given vector 
 
 In the AI era, embeddings are everywhere – from language models like GPT to vision transformers. Storing and searching them efficiently is the foundation of intelligent applications.
 
-## 🌍 Perfect for Edge AI
+## Perfect for Edge AI
 
 SQLite-Vector is designed with the **Edge AI** use case in mind:
 
-* 📴 Runs offline – no internet required
-* 📱 Works on mobile devices – iOS/Android friendly
-* 🔒 Keeps data local – ideal for privacy-focused apps
-* ⚡ Extremely fast – real-time performance on device
+* Runs offline – no internet required
+* Works on mobile devices – iOS/Android friendly
+* Keeps data local – ideal for privacy-focused apps
+* Extremely fast – real-time performance on device
 
 You can deploy powerful similarity search capabilities right inside your app or embedded system – **no cloud needed**.
 
-## 📦 Integrations
+## Integrations
 
 Use SQLite-AI alongside:
 
