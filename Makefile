@@ -113,7 +113,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(CFLAGS) -O3 -fPIC -c $< -o $@
 
 test: $(TARGET)
-	$(SQLITE3) ":memory:" -cmd ".bail on" ".load ./$<" "SELECT vector_version();"
+	$(SQLITE3) ":memory:" -cmd ".bail on" ".load ./vector" "SELECT vector_version();"
 
 # Clean up generated files
 clean:
