@@ -15,13 +15,18 @@
 
 // Detect builtin bit_cast
 #ifndef HAVE_BUILTIN_BIT_CAST
+  /* Only use __builtin_bit_cast if the compiler has it AND
+     we're compiling as C++ (GCC 11+) or as a C standard that supports it (C23+). */
   #if defined(__has_builtin)
     #if __has_builtin(__builtin_bit_cast)
-      #define HAVE_BUILTIN_BIT_CAST 1
+      #if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+        #define HAVE_BUILTIN_BIT_CAST 1
+      #endif
     #endif
   #endif
-  /* GCC 11+ also has __builtin_bit_cast */
-  #if !defined(HAVE_BUILTIN_BIT_CAST) && defined(__GNUC__) && !defined(__clang__)
+
+  /* GCC note: in GCC 11–13, __builtin_bit_cast exists for C++ but NOT for C. */
+  #if !defined(HAVE_BUILTIN_BIT_CAST) && defined(__GNUC__) && !defined(__clang__) && defined(__cplusplus)
     #if __GNUC__ >= 11
       #define HAVE_BUILTIN_BIT_CAST 1
     #endif
