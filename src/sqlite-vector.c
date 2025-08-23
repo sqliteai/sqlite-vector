@@ -10,6 +10,7 @@
 #include "distance-cpu.h"
 
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <limits.h>
@@ -957,6 +958,10 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
     
     // means ignore unknown keys
     return true;
+}
+
+static inline int nearly_zero_float32 (float x) {
+    return fabsf(x) <= 8.0f * FLT_EPSILON;  // tweak factor for your use
 }
 
 // MARK: - SQL -
@@ -1930,7 +1935,8 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
         if (rc != SQLITE_ROW) goto cleanup;
         
         float *v2 = (float *)sqlite3_column_blob(vm, 1);
-        double distance = distance_fn((const void *)v1, (const void *)v2, dimension);
+        float distance = distance_fn((const void *)v1, (const void *)v2, dimension);
+        if (nearly_zero_float32(distance)) distance = 0.0;
         VECTOR_PRINT((void*)v2, vt, dimension);
         
         if (distance < c->distance[c->max_index]) {
@@ -1974,7 +1980,8 @@ static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, vector_qtype qtype, i
         const uint8_t *vector_data = current_data + rowid_size;
 
         float dist = distance_fn((const void *)v, (const void *)vector_data, dim);
-
+        if (nearly_zero_float32(dist)) dist = 0.0;
+        
         if (dist < current_max) {
             distance[max_index] = dist;
             rowids[max_index] = INT64_FROM_INT8PTR(current_data);
@@ -2046,7 +2053,8 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         for (int i=0; i<counter; ++i) {
             const uint8_t *current_data = data + (i * total_stride);
             const uint8_t *vector_data = current_data + rowid_size;
-            double distance = (double)distance_fn((const void *)v, (const void *)vector_data, dimension);
+            float distance = distance_fn((const void *)v, (const void *)vector_data, dimension);
+            if (nearly_zero_float32(distance)) distance = 0.0;
             VECTOR_PRINT((void*)vector_data, vt, dimension);
             
             if (distance < current_max_distance) {
