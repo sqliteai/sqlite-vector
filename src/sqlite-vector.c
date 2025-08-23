@@ -53,6 +53,13 @@ SQLITE_EXTENSION_INIT1
 #define DEBUG_VECTOR(...)
 #endif
 
+#define DEBUG_VECTOR_SERIALIZATION                  0
+#if DEBUG_VECTOR_SERIALIZATION
+#define VECTOR_PRINT(_b,_t,_n)                      vector_print(_b,_t,_n)
+#else
+#define VECTOR_PRINT(_b,_t,_n)
+#endif
+
 #define SKIP_SPACES(_p)                             while (*(_p) && isspace((unsigned char)*(_p))) (_p)++
 #define TRIM_TRAILING(_start, _len)                 while ((_len) > 0 && isspace((unsigned char)(_start)[(_len) - 1])) (_len)--
 
@@ -451,9 +458,31 @@ cleanup:
     return rc;
 }
 
-// MARK: - General Utils -
+// MARK: - Quantization -
 
-static inline void quantize_float32_to_unsigned8bit (float *v, uint8_t *q, float offset, float scale, int n) {
+static inline uint8_t q_round_u8 (float s) {
+    if (!isfinite(s)) {
+        return (s > 0.0f) ? 255u : 0u;   /* NaN -> 0, +Inf -> 255, -Inf -> 0 */
+    }
+    float r = s + 0.5f * (1.0f - 2.0f * (s < 0.0f));  /* half away from zero */
+    if (r >= 255.0f) return 255u;
+    if (r <= 0.0f)   return 0u;
+    int ir = (int)r;                      /* safe after the clamp above */
+    return (uint8_t)ir;
+}
+
+static inline int8_t q_round_s8 (float s) {
+    if (!isfinite(s)) {
+        return (s > 0.0f) ? 127 : (s < 0.0f ? -128 : 0);
+    }
+    /* half-away-from-zero */
+    float r = s + 0.5f * (1.0f - 2.0f * (s < 0.0f));
+    if (r >= 127.0f)  return 127;
+    if (r <= -128.0f) return -128;
+    return (int8_t)(int)r;
+}
+
+static inline void quantize_float32_to_unsigned8bit (const float *v, uint8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
         float s0 = (v[i]     - offset) * scale;
@@ -486,7 +515,83 @@ static inline void quantize_float32_to_unsigned8bit (float *v, uint8_t *q, float
     }
 }
 
-static inline void quantize_float32_to_signed8bit (float *v, int8_t *q, float offset, float scale, int n) {
+static inline void quantize_float16_to_unsigned8bit (const uint16_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = float16_to_float32(v[i    ]);
+        float x1 = float16_to_float32(v[i + 1]);
+        float x2 = float16_to_float32(v[i + 2]);
+        float x3 = float16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = float16_to_float32(v[i]);
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_bfloat16_to_unsigned8bit (const uint16_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = bfloat16_to_float32(v[i    ]);
+        float x1 = bfloat16_to_float32(v[i + 1]);
+        float x2 = bfloat16_to_float32(v[i + 2]);
+        float x3 = bfloat16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = bfloat16_to_float32(v[i]);
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_u8_to_unsigned8bit (const uint8_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_i8_to_unsigned8bit (const int8_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_float32_to_signed8bit (const float *v, int8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
         float s0 = (v[i]     - offset) * scale;
@@ -517,6 +622,109 @@ static inline void quantize_float32_to_signed8bit (float *v, int8_t *q, float of
         q[i] = (int8_t)rounded;
     }
 }
+
+static inline void quantize_float16_to_signed8bit (const uint16_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = float16_to_float32(v[i    ]);
+        float x1 = float16_to_float32(v[i + 1]);
+        float x2 = float16_to_float32(v[i + 2]);
+        float x3 = float16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = float16_to_float32(v[i]);
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_bfloat16_to_signed8bit (const uint16_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = bfloat16_to_float32(v[i    ]);
+        float x1 = bfloat16_to_float32(v[i + 1]);
+        float x2 = bfloat16_to_float32(v[i + 2]);
+        float x3 = bfloat16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = bfloat16_to_float32(v[i]);
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_u8_to_signed8bit (const uint8_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_i8_to_signed8bit (const int8_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_float32 (const float *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_float32_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_float32_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_float16 (const uint16_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_float16_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_float16_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_bfloat16 (const uint16_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_bfloat16_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_bfloat16_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_u8 (const uint8_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_u8_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_u8_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_i8 (const int8_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_i8_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_i8_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+// MARK: - General Utils -
 
 static size_t vector_type_to_size (vector_type type) {
     switch (type) {
@@ -570,13 +778,53 @@ static vector_distance distance_name_to_type (const char *dname) {
 const char *vector_distance_to_name (vector_distance type) {
     switch (type) {
         case VECTOR_DISTANCE_L2: return "L2";
-        case VECTOR_DISTANCE_SQUARED_L2: return "L2 SQUARED";
+        case VECTOR_DISTANCE_SQUARED_L2: return "SQUARED_L2";
         case VECTOR_DISTANCE_COSINE: return "COSINE";
         case VECTOR_DISTANCE_DOT: return "DOT";
         case VECTOR_DISTANCE_L1: return "L1";
     }
     return "N/A";
 }
+
+#if DEBUG_VECTOR_SERIALIZATION
+static void vector_print (void *buf, vector_type type, int n) {
+    printf("type: %s - dim: %d [", vector_type_to_name(type), n);
+    for (int i=0; i<n; ++i) {
+        switch (type) {
+            case VECTOR_TYPE_F32: {
+                float *f = (float *)buf;
+                printf("%f,", f[i]);
+            }
+            break;
+                
+            case VECTOR_TYPE_F16: {
+                uint16_t *f = (uint16_t *)buf;
+                printf("%f,", float16_to_float32(f[i]));
+            }
+            break;
+                
+            case VECTOR_TYPE_BF16: {
+                uint16_t *f = (uint16_t *)buf;
+                printf("%f,", bfloat16_to_float32(f[i]));
+            }
+            break;
+                
+            case VECTOR_TYPE_U8: {
+                uint8_t *u = (uint8_t *)buf;
+                printf("%d,", u[i]);
+            }
+            break;
+                
+            case VECTOR_TYPE_I8: {
+                int8_t *u = (int8_t *)buf;
+                printf("%d,", u[i]);
+            }
+            break;
+        }
+    }
+    printf("]\n");
+}
+#endif
 
 static bool sanity_check_args (sqlite3_context *context, const char *func_name, int argc, sqlite3_value **argv, int ntypes, int *types) {
     if (argc != ntypes) {
@@ -871,25 +1119,37 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     float *tempv = NULL;
     
     // compute size of a single quant, format is: rowid + quantize dimensions
-    int q_size = sizeof(int64_t) + (dim * sizeof(uint8_t));
+    size_t q_size = sizeof(int64_t) + (size_t)dim * sizeof(uint8_t);
+    if (q_size == 0) {
+        sqlite3_result_error(context, "Vector dimension is zero, which is not possible.", -1);
+        return SQLITE_MISUSE;
+    }
     
     // max_memory == 0 means use all required memory
     if (max_memory == 0) {
-        char sql[STATIC_SQL_SIZE];
         sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*) FROM %q;", table_name);
-        
         int64_t count = sqlite_read_int64(db, sql);
-        max_memory = (count == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)(count * q_size);
+        max_memory = (count == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)count * (uint64_t)q_size;
+        if (count <= 0) {
+            // no vectors
+            t_ctx->options.q_type = (qtype == VECTOR_QUANT_AUTO) ? VECTOR_QUANT_U8BIT : qtype;
+            t_ctx->scale = 1.0f;
+            t_ctx->offset = 0.0f;
+            return SQLITE_OK;
+        }
     }
     
-    // max number of vectors that fits in max_memory
-    uint32_t max_vectors = (uint32_t)(max_memory / q_size);
+    // max number of vectors that fits in max_memory (per batch; force at least 1)
+    uint32_t max_vectors = (uint32_t)(max_memory / (uint64_t)q_size);
+    if (max_vectors == 0) max_vectors = 1;
     
-    uint8_t *data = sqlite3_malloc64((sqlite3_uint64)(max_vectors * q_size));
+    sqlite3_uint64 out_bytes = (sqlite3_uint64)max_vectors * (sqlite3_uint64)q_size;
+    uint8_t *data = sqlite3_malloc64(out_bytes);
     uint8_t *original = data;
     if (!data) goto vector_rebuild_quantization_cleanup;
     
-    tempv = (float *)sqlite3_malloc(sizeof(float) * dim);
+    sqlite3_uint64 temp_bytes = (sqlite3_uint64)dim * (sqlite3_uint64)sizeof(float);
+    tempv = (float *)sqlite3_malloc64(temp_bytes);
     if (!tempv) goto vector_rebuild_quantization_cleanup;
         
     // SELECT rowid, embedding FROM table
@@ -906,8 +1166,8 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     float min_val = MAXFLOAT;
     float max_val = -MAXFLOAT;
     #endif
-    
     bool contains_negative = false;
+    
     while (1) {
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
@@ -915,7 +1175,8 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         
         const void *blob = (float *)sqlite3_column_blob(vm, 1);
         int blob_size = sqlite3_column_bytes(vm, 1);
-        if (!blob || blob_size < dim * vector_type_to_size(type)) {
+        size_t need_bytes = (size_t)dim * (size_t)vector_type_to_size(type);
+        if (!blob || blob_size < need_bytes) {
             context_result_error(context, SQLITE_ERROR, "Invalid or missing vector blob found at rowid %lld.", (long long)sqlite3_column_int64(vm, 0));
             rc = SQLITE_ERROR;
             goto vector_rebuild_quantization_cleanup;
@@ -928,7 +1189,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
                     val = ((float *)blob)[i];
                     break;
                 case VECTOR_TYPE_F16:
-                    val = fp16_ieee_to_fp32_value(((uint16_t *)blob)[i]);
+                    val = float16_to_float32(((uint16_t *)blob)[i]);
                     break;
                 case VECTOR_TYPE_BF16:
                     val = bfloat16_to_float32(((uint16_t *)blob)[i]);
@@ -984,40 +1245,23 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         int64_t rowid = (int64_t)sqlite3_column_int64(vm, 0);
         const void *blob = sqlite3_column_blob(vm, 1);
         if (n_processed == 0) min_rowid = rowid;
-        
-        float *v = tempv;
-        if (type == VECTOR_TYPE_F32) {
-            v = (float *)blob;
-        } else {
-            for (int i = 0; i < dim; ++i) {
-                switch (type) {
-                    case VECTOR_TYPE_F32:
-                        break;
-                    case VECTOR_TYPE_F16:
-                        v[i] = fp16_ieee_to_fp32_value(((uint16_t *)blob)[i]);
-                        break;
-                    case VECTOR_TYPE_BF16:
-                        v[i] = bfloat16_to_float32(((uint16_t *)blob)[i]);
-                        break;
-                    case VECTOR_TYPE_U8:
-                        v[i] = (float)(((uint8_t *)blob)[i]);
-                        break;
-                    case VECTOR_TYPE_I8:
-                        v[i] = (float)(((int8_t *)blob)[i]);
-                        break;
-                }
-            }
-        }
+        VECTOR_PRINT((void *)blob, type, dim);
         
         // copy rowid
         INT64_TO_INT8PTR(rowid, data);
         data += sizeof(int64_t);
         
         // quantize vector
-        if (qtype == VECTOR_QUANT_U8BIT) quantize_float32_to_unsigned8bit(v, data, offset, scale, dim);
-        else quantize_float32_to_signed8bit(v, (int8_t *)data, offset, scale, dim);
-        data += (dim * sizeof(uint8_t));
+        switch (type) {
+            case VECTOR_TYPE_F32: quantize_float32((const float *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_F16: quantize_float16((const uint16_t *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_I8: quantize_i8((const int8_t *)blob, data, offset, scale, dim, qtype); break;
+        }
+        VECTOR_PRINT((void *)data, (qtype == VECTOR_QUANT_U8BIT) ? VECTOR_TYPE_U8 : VECTOR_TYPE_I8, dim);
         
+        data += (dim * sizeof(uint8_t));
         max_rowid = rowid;
         ++n_processed;
         ++tot_processed;
@@ -1389,6 +1633,8 @@ static void vector_as_type (sqlite3_context *context, vector_type type, int argc
         char *blob = vector_from_json(context, NULL, type, json, &value_size, dimension);
         if (!blob) return; // error is set in the context
         
+        VECTOR_PRINT((void *)blob, type, (dimension == 0) ? (value_size / vector_type_to_size(type)) : dimension);
+        
         sqlite3_result_blob(context, (const void *)blob, value_size, sqlite3_free);
         return;
     }
@@ -1466,6 +1712,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
     }
+    VECTOR_PRINT((void*)vector, t_ctx->options.v_type, t_ctx->options.v_dim);
     
     if (check_quant) {
         char buffer[STATIC_SQL_SIZE];
@@ -1684,6 +1931,7 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
         
         float *v2 = (float *)sqlite3_column_blob(vm, 1);
         double distance = distance_fn((const void *)v1, (const void *)v2, dimension);
+        VECTOR_PRINT((void*)v2, vt, dimension);
         
         if (distance < c->distance[c->max_index]) {
             c->distance[c->max_index] = distance;
@@ -1747,17 +1995,26 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     uint8_t *v = (uint8_t *)sqlite3_malloc(dimension * sizeof(int8_t));
     if (!v) return SQLITE_NOMEM;
     
+    // quantize vector
     vector_qtype qtype = c->table->options.q_type;
-    if (qtype == VECTOR_QUANT_U8BIT) {
-        quantize_float32_to_unsigned8bit((float *)v1, v, c->table->offset, c->table->scale, dimension);
-    } else {
-        quantize_float32_to_signed8bit((float *)v1, (int8_t *)v, c->table->offset, c->table->scale, dimension);
+    float offset = c->table->offset;
+    float scale = c->table->scale;
+    vector_type type = c->table->options.v_type;
+    
+    switch (type) {
+        case VECTOR_TYPE_F32: quantize_float32((const float *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_F16: quantize_float16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_I8: quantize_i8((const int8_t *)v1, v, offset, scale, dimension, qtype); break;
     }
+    
     if (c->table->preloaded) {
         int rc = vQuantRunMemory(c, v, qtype, dimension);
         if (v) sqlite3_free(v);
         return rc;
     }
+    VECTOR_PRINT((void*)v, (qtype == VECTOR_QUANT_U8BIT) ? VECTOR_TYPE_U8 : VECTOR_TYPE_I8, dimension);
     
     char sql[STATIC_SQL_SIZE];
     generate_select_quant_table(c->table->t_name, c->table->c_name, sql);
@@ -1790,6 +2047,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
             const uint8_t *current_data = data + (i * total_stride);
             const uint8_t *vector_data = current_data + rowid_size;
             double distance = (double)distance_fn((const void *)v, (const void *)vector_data, dimension);
+            VECTOR_PRINT((void*)vector_data, vt, dimension);
             
             if (distance < current_max_distance) {
                 c->distance[c->max_index] = distance;
