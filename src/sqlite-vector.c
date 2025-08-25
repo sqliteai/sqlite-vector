@@ -1018,6 +1018,8 @@ void vector_context_free (void *p) {
 }
 
 table_context *vector_context_lookup (vector_context *ctx, const char *table_name, const char *column_name) {
+    if ((table_name == NULL) || (column_name == NULL)) return NULL;
+    
     for (int i=0; i<ctx->table_count; ++i) {
         // tname and cname can be NULL after adding vector_cleanup function
         const char *tname = ctx->tables[i].t_name;
@@ -1177,12 +1179,15 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
         else if (rc != SQLITE_ROW) break;
+        if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
         
         const void *blob = (float *)sqlite3_column_blob(vm, 1);
+        if (!blob) continue;
+        
         int blob_size = sqlite3_column_bytes(vm, 1);
         size_t need_bytes = (size_t)dim * (size_t)vector_type_to_size(type);
-        if (!blob || blob_size < need_bytes) {
-            context_result_error(context, SQLITE_ERROR, "Invalid or missing vector blob found at rowid %lld.", (long long)sqlite3_column_int64(vm, 0));
+        if (blob_size < need_bytes) {
+            context_result_error(context, SQLITE_ERROR, "Invalid vector blob found at rowid %lld.", (long long)sqlite3_column_int64(vm, 0));
             rc = SQLITE_ERROR;
             goto vector_rebuild_quantization_cleanup;
         }
@@ -1246,9 +1251,12 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
         else if (rc != SQLITE_ROW) break;
+        if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
         
         int64_t rowid = (int64_t)sqlite3_column_int64(vm, 0);
         const void *blob = sqlite3_column_blob(vm, 1);
+        if (!blob) continue;
+        
         if (n_processed == 0) min_rowid = rowid;
         VECTOR_PRINT((void *)blob, type, dim);
         
@@ -1716,6 +1724,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     } else {
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
+        if (!vector) return sqlite_vtab_set_error(&vtab->base, "%s: input vector cannot be NULL.", fname);
     }
     VECTOR_PRINT((void*)vector, t_ctx->options.v_type, t_ctx->options.v_dim);
     
@@ -1933,8 +1942,11 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; goto cleanup;}
         if (rc != SQLITE_ROW) goto cleanup;
+        if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
         
         float *v2 = (float *)sqlite3_column_blob(vm, 1);
+        if (v2 == NULL) continue;
+        
         float distance = distance_fn((const void *)v1, (const void *)v2, dimension);
         if (nearly_zero_float32(distance)) distance = 0.0;
         VECTOR_PRINT((void*)v2, vt, dimension);
