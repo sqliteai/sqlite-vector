@@ -52,6 +52,16 @@ SELECT load_extension('./vector');
 
 Or embed it directly into your application.
 
+### Python Package
+
+Python developers can quickly get started using the ready-to-use `sqlite-vector` package available on PyPI:
+
+```bash
+pip install sqlite-vector
+```
+
+For usage details and examples, see the [Python package documentation](./packages/python/README.md).
+
 ## Example Usage
 
 ```sql
