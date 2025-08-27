@@ -1,0 +1,96 @@
+name: Build and Publish Python Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to use for the Python package (e.g. 0.9.9)"
+        required: true
+        type: string
+  release:
+    types: [published]
+
+jobs:
+  build-and-publish:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write  # mandatory for Pypi trusted publishing
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            python-version: "3.10"
+            arch: x86_64
+            plat_name: manylinux2014_x86_64
+          - os: ubuntu-latest
+            platform: linux
+            python-version: "3.10"
+            arch: arm64
+            plat_name: manylinux2014_aarch64
+          - os: ubuntu-latest
+            platform: windows
+            python-version: "3.10"
+            arch: x86_64
+            plat_name: win_amd64
+          - os: ubuntu-latest
+            platform: macos
+            python-version: "3.10"
+            arch: x86_64
+            plat_name: macosx_10_9_x86_64
+          - os: ubuntu-latest
+            platform: macos
+            python-version: "3.10"
+            arch: arm64
+            plat_name: macosx_11_0_arm64    
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          cd packages/python
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-dev.txt
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION="${{ github.event.release.tag_name }}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          VERSION=${VERSION#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download artifacts for current platform
+        run: |
+          cd packages/python
+          python3 download_artifacts.py "${{ matrix.plat_name }}" "${{ steps.get_version.outputs.version }}"
+
+      - name: Build wheel
+        env:
+          PACKAGE_VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          cd packages/python
+          python setup.py bdist_wheel --plat-name "${{ matrix.plat_name }}"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist
+          verbose: true
+          # Avoid workflow to fail if the version has already been published
+          skip-existing: true
+          # Upload to Test Pypi for testing
+          repository-url: https://test.pypi.org/legacy/
