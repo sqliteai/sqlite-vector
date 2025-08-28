@@ -97,6 +97,8 @@ SELECT vector_init('documents', 'embedding', 'dimension=384,type=FLOAT32,distanc
 Performs quantization on the specified table and column. This precomputes internal data structures to support fast approximate nearest neighbor (ANN) search.
 Read more about quantization [here](https://github.com/sqliteai/sqlite-vector/blob/main/QUANTIZATION.md).
 
+If a quantization already exists for the specified table and column, it is replaced. If it was previously loaded into memory using `vector_quantize_preload`, the data is automatically reloaded.
+
 **Parameters:**
 
 * `table` (TEXT): Name of the table.
@@ -153,7 +155,10 @@ SELECT vector_quantize_preload('documents', 'embedding');
 **Returns:** `NULL`
 
 **Description:**
-Cleans up internal structures related to a previously quantized table/column. Use this if data has changed or quantization is no longer needed.
+Releases memory previously allocated by a vector_quantize_preload call and removes all quantization entries associated with the specified table and column.
+Use this function when the underlying data has changed or when quantization is no longer required. In some cases, running VACUUM may be necessary to reclaim the freed space from the database.
+
+This function should only be called when quantization is no longer needed. If the data changes and you invoke vector_quantize, the old quantization data is automatically replaced.
 
 **Example:**
 
