@@ -8,7 +8,7 @@ on:
         required: true
         type: string
   release:
-    types: [published]
+    types: [released]
 
 jobs:
   build-and-publish:
