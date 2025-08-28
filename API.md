@@ -56,6 +56,7 @@ SELECT vector_backend();
 
 **Description:**
 Initializes the vector extension for a given table and column. This is **mandatory** before performing any vector search or quantization.
+`vector_init` must be called in every database connection that needs to perform vector operations.
 
 **Parameters:**
 
@@ -97,7 +98,7 @@ SELECT vector_init('documents', 'embedding', 'dimension=384,type=FLOAT32,distanc
 Performs quantization on the specified table and column. This precomputes internal data structures to support fast approximate nearest neighbor (ANN) search.
 Read more about quantization [here](https://github.com/sqliteai/sqlite-vector/blob/main/QUANTIZATION.md).
 
-If a quantization already exists for the specified table and column, it is replaced. If it was previously loaded into memory using `vector_quantize_preload`, the data is automatically reloaded.
+If a quantization already exists for the specified table and column, it is replaced. If it was previously loaded into memory using `vector_quantize_preload`, the data is automatically reloaded. `vector_quantize` should be called once after data insertion. If called multiple times, the previous quantized data is replaced. The resulting quantization is shared across all database connections, so they do not need to call it again.
 
 **Parameters:**
 
@@ -139,8 +140,7 @@ SELECT vector_quantize_memory('documents', 'embedding');
 
 **Description:**
 Loads the quantized representation for the specified table and column into memory. Should be used at startup to ensure optimal query performance.
-
-Execute it after `vector_quantize()` to reflect changes.
+`vector_quantize_preload` should be called once after `vector_quantize`. The preloaded data is also shared across all database connections, so they do not need to call it again.
 
 **Example:**
 
