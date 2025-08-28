@@ -150,7 +150,7 @@ SELECT vector_quantize_preload('documents', 'embedding');
 
 ---
 
-## `vector_cleanup(table, column)`
+## `vector_quantize_cleanup(table, column)`
 
 **Returns:** `NULL`
 
@@ -163,7 +163,7 @@ This function should only be called when quantization is no longer needed. If th
 **Example:**
 
 ```sql
-SELECT vector_cleanup('documents', 'embedding');
+SELECT vector_quantize_cleanup('documents', 'embedding');
 ```
 
 ---
