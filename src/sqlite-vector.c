@@ -1113,12 +1113,13 @@ vector_serialize_quantization_cleanup:
     return rc;
 }
 
-static int vector_rebuild_quantization (sqlite3_context *context, const char *table_name, const char *column_name, table_context *t_ctx, vector_qtype qtype, uint64_t max_memory) {
+static int vector_rebuild_quantization (sqlite3_context *context, const char *table_name, const char *column_name, table_context *t_ctx, vector_qtype qtype, uint64_t max_memory, uint32_t *count) {
     
     int rc = SQLITE_NOMEM;
     sqlite3_stmt *vm = NULL;
     char sql[STATIC_SQL_SIZE];
     sqlite3 *db = sqlite3_context_db_handle(context);
+    uint32_t tot_processed = 0;
     
     const char *pk_name = t_ctx->pk_name;
     int dim = t_ctx->options.v_dim;
@@ -1245,7 +1246,6 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     // STEP 3
     // actual quantization (ONLY 8bit is supported in this version)
     uint32_t n_processed = 0;
-    uint32_t tot_processed = 0;
     int64_t min_rowid = 0, max_rowid = 0;
     while (1) {
         rc = sqlite3_step(vm);
@@ -1299,90 +1299,8 @@ vector_rebuild_quantization_cleanup:
     if (original) sqlite3_free(original);
     if (tempv) sqlite3_free(tempv);
     if (vm) sqlite3_finalize(vm);
+    if (count) *count = tot_processed;
     return rc;
-}
-
-static void vector_quantize (sqlite3_context *context, const char *table_name, const char *column_name, const char *arg_options) {
-    table_context *t_ctx = vector_context_lookup((vector_context *)sqlite3_user_data(context), table_name, column_name);
-    if (!t_ctx) {
-        context_result_error(context, SQLITE_ERROR, "Vector context not found for table '%s' and column '%s'. Ensure that vector_init() has been called before using vector_quantize().", table_name, column_name);
-        return;
-    }
-    
-    int rc = SQLITE_ERROR;
-    char sql[STATIC_SQL_SIZE];
-    sqlite3 *db = sqlite3_context_db_handle(context);
-    
-    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    generate_drop_quant_table(table_name, column_name, sql);
-    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    generate_create_quant_table(table_name, column_name, sql);
-    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    vector_options options = vector_options_create();
-    bool res = parse_keyvalue_string(context, arg_options, vector_keyvalue_callback, &options);
-    if (res == false) return;
-    
-    rc = vector_rebuild_quantization(context, table_name, column_name, t_ctx, options.q_type, options.max_memory);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    // serialize quantization options
-    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_QUANTTYPE, t_ctx->options.q_type, 0);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTSCALE, 0, t_ctx->scale);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTOFFSET, 0, t_ctx->offset);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-quantize_cleanup:
-    if (rc != SQLITE_OK) {
-        printf("%s", sqlite3_errmsg(db));
-        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-        sqlite3_result_error_code(context, rc);
-        return;
-    }
-}
-
-static void vector_quantize3 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    int types[] = {SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_quantize", argc, argv, 3, types) == false) return;
-    
-    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
-    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
-    const char *options = (const char *)sqlite3_value_text(argv[2]);
-    vector_quantize(context, table_name, column_name, options);
-}
-
-static void vector_quantize2 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_quantize", argc, argv, 2, types) == false) return;
-    
-    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
-    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
-    vector_quantize(context, table_name, column_name, NULL);
-}
-
-static void vector_quantize_memory (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_quantize_memory", argc, argv, 2, types) == false) return;
-    
-    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
-    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
-    
-    char sql[STATIC_SQL_SIZE];
-    generate_memory_quant_table(table_name, column_name, sql);
-    
-    sqlite3 *db = sqlite3_context_db_handle(context);
-    sqlite3_int64 memory = sqlite_read_int64(db, sql);
-    sqlite3_result_int64(context, memory);
 }
 
 static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3_value **argv) {
@@ -1453,9 +1371,104 @@ vector_preload_cleanup:
     return;
 }
 
-static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **argv) {
+static int vector_quantize (sqlite3_context *context, const char *table_name, const char *column_name, const char *arg_options, bool *was_preloaded) {
+    table_context *t_ctx = vector_context_lookup((vector_context *)sqlite3_user_data(context), table_name, column_name);
+    if (!t_ctx) {
+        context_result_error(context, SQLITE_ERROR, "Vector context not found for table '%s' and column '%s'. Ensure that vector_init() has been called before using vector_quantize().", table_name, column_name);
+        return SQLITE_ERROR;
+    }
+    
+    uint32_t counter = 0;
+    int rc = SQLITE_ERROR;
+    char sql[STATIC_SQL_SIZE];
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    generate_drop_quant_table(table_name, column_name, sql);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    generate_create_quant_table(table_name, column_name, sql);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    vector_options options = vector_options_create();
+    bool res = parse_keyvalue_string(context, arg_options, vector_keyvalue_callback, &options);
+    if (res == false) return SQLITE_ERROR;
+    
+    rc = vector_rebuild_quantization(context, table_name, column_name, t_ctx, options.q_type, options.max_memory, &counter);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    // serialize quantization options
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_QUANTTYPE, t_ctx->options.q_type, 0);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTSCALE, 0, t_ctx->scale);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTOFFSET, 0, t_ctx->offset);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+quantize_cleanup:
+    if (rc != SQLITE_OK) {
+        printf("%s", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        sqlite3_result_error_code(context, rc);
+        return rc;
+    }
+    
+    // returns the total number of quantized rows
+    sqlite3_result_int64(context, (sqlite3_int64)counter);
+    if (was_preloaded) *was_preloaded = (t_ctx->preloaded != NULL);
+    return SQLITE_OK;
+}
+
+static void vector_quantize3 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_quantize", argc, argv, 3, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    const char *options = (const char *)sqlite3_value_text(argv[2]);
+    
+    bool was_preloaded = false;
+    int rc = vector_quantize(context, table_name, column_name, options, &was_preloaded);
+    if ((rc == SQLITE_OK) && (was_preloaded)) vector_quantize_preload(context, argc, argv);
+}
+
+static void vector_quantize2 (sqlite3_context *context, int argc, sqlite3_value **argv) {
     int types[] = {SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_cleanup", argc, argv, 2, types) == false) return;
+    if (sanity_check_args(context, "vector_quantize", argc, argv, 2, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    
+    bool was_preloaded = false;
+    int rc = vector_quantize(context, table_name, column_name, NULL, &was_preloaded);
+    if ((rc == SQLITE_OK) && (was_preloaded)) vector_quantize_preload(context, argc, argv);
+}
+
+static void vector_quantize_memory (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_quantize_memory", argc, argv, 2, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    
+    char sql[STATIC_SQL_SIZE];
+    generate_memory_quant_table(table_name, column_name, sql);
+    
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_int64 memory = sqlite_read_int64(db, sql);
+    sqlite3_result_int64(context, memory);
+}
+
+static void vector_quantize_cleanup (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_quantize_cleanup", argc, argv, 2, types) == false) return;
     
     const char *table_name = (const char *)sqlite3_value_text(argv[0]);
     const char *column_name = (const char *)sqlite3_value_text(argv[1]);
@@ -1464,20 +1477,18 @@ static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **
     table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
     if (!t_ctx) return; // if no table context exists then do nothing
     
-    // release memory
-    if (t_ctx->t_name) sqlite3_free(t_ctx->t_name);
-    if (t_ctx->c_name) sqlite3_free(t_ctx->c_name);
-    if (t_ctx->pk_name) sqlite3_free(t_ctx->pk_name);
-    if (t_ctx->preloaded) sqlite3_free(t_ctx->preloaded);
-    memset(t_ctx, 0, sizeof(table_context));
+    // release any memory used in quantization
+    if (t_ctx->preloaded) {
+        sqlite3_free(t_ctx->preloaded);
+        t_ctx->preloaded = NULL;
+        t_ctx->precounter = 0;
+    }
     
     // drop quant table (if any)
     char sql[STATIC_SQL_SIZE];
     sqlite3 *db = sqlite3_context_db_handle(context);
     generate_drop_quant_table(table_name, column_name, sql);
     sqlite3_exec(db, sql, NULL, NULL, NULL);
-    
-    // do not decrease v_ctx->table_count
 }
 
 // MARK: -
@@ -2260,7 +2271,7 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     if (rc != SQLITE_OK) goto cleanup;
     
     // table_name, column_name
-    rc = sqlite3_create_function(db, "vector_cleanup", 2, SQLITE_UTF8, ctx, vector_cleanup, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_quantize_cleanup", 2, SQLITE_UTF8, ctx, vector_quantize_cleanup, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_as_f32", 1, SQLITE_UTF8, ctx, vector_as_f32, NULL, NULL);
