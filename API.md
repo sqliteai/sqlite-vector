@@ -157,10 +157,10 @@ SELECT vector_quantize_preload('documents', 'embedding');
 **Returns:** `NULL`
 
 **Description:**
-Releases memory previously allocated by a vector_quantize_preload call and removes all quantization entries associated with the specified table and column.
-Use this function when the underlying data has changed or when quantization is no longer required. In some cases, running VACUUM may be necessary to reclaim the freed space from the database.
+Releases memory previously allocated by a `vector_quantize_preload` call and removes all quantization entries associated with the specified table and column.
+Use this function when quantization is no longer required. In some cases, running VACUUM may be necessary to reclaim the freed space from the database.
 
-This function should only be called when quantization is no longer needed. If the data changes and you invoke vector_quantize, the old quantization data is automatically replaced.
+If the data changes and you invoke `vector_quantize`, the existing quantization data is automatically replaced. In that case, calling this function is unnecessary.
 
 **Example:**
 
