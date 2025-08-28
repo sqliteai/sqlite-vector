@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "toml"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlite-vector"
+dynamic = ["version"]
+description = "Python prebuilt binaries for SQLite Vector extension for all supported platforms and architectures."
+authors = [
+    { name = "SQLite AI Team" }
+]
+readme = "README.md"
+requires-python = ">=3"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X"
+]
+
+[project.urls]
+Homepage = "https://sqlite.ai"
+Documentation = "https://github.com/sqliteai/sqlite-vector/blob/main/API.md"
+Repository = "https://github.com/sqliteai/sqlite-vector"
+Issues = "https://github.com/sqliteai/sqlite-vector/issues"
