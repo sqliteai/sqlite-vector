@@ -9,57 +9,112 @@ permissions:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.name }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }} build${{ matrix.arch != 'arm64-v8a' && matrix.name != 'isim' && matrix.name != 'ios' && ' + test' || ''}}
+    container: ${{ matrix.container && matrix.container || '' }}
+    name: ${{ matrix.name }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }} build${{ matrix.arch != 'arm64-v8a' && matrix.name != 'ios-sim' && matrix.name != 'ios' && matrix.name != 'apple-xcframework' && ' + test' || ''}}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             arch: x86_64
             name: linux
-          - os: LinuxARM64
+          - os: ubuntu-22.04-arm
             arch: arm64
             name: linux
-          - os: macos-latest
+          - os: ubuntu-22.04
+            arch: x86_64
+            name: linux-musl
+            container: alpine:latest
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            name: linux-musl
+          - os: macos-15
             name: macos
-          - os: windows-latest
+          - os: windows-2022
             arch: x86_64
             name: windows
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             arch: arm64-v8a
             name: android
             make: PLATFORM=android ARCH=arm64-v8a
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             arch: x86_64
             name: android
             make: PLATFORM=android ARCH=x86_64
             sqlite-amalgamation-zip: https://sqlite.org/2025/sqlite-amalgamation-3490100.zip
-          - os: macos-latest
+          - os: macos-15
             name: ios
             make: PLATFORM=ios
-          - os: macos-latest
-            name: isim
-            make: PLATFORM=isim
+          - os: macos-15
+            name: ios-sim
+            make: PLATFORM=ios-sim
+          - os: macos-15
+            name: apple-xcframework
+            make: xcframework
 
     defaults:
       run:
-        shell: bash
+        shell: ${{ matrix.container && 'sh' || 'bash' }}
 
     steps:
 
       - uses: actions/checkout@v4.2.2
 
-      - name: build sqlite-vector
-        run: make extension ${{ matrix.make && matrix.make || ''}}
-
-      - name: windows install sqlite3
-        if: matrix.os == 'windows-latest'
+      - name: windows install dependencies
+        if: matrix.name == 'windows'
         run: choco install sqlite -y
 
-      - name: macos install sqlite3 without SQLITE_OMIT_LOAD_EXTENSION
+      - name: macos install dependencies
         if: matrix.name == 'macos'
         run: brew link sqlite --force
+
+      - name: linux-musl x86_64 install dependencies
+        if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
+        run: apk update && apk add --no-cache gcc make sqlite musl-dev linux-headers
+
+      - name: linux-musl arm64 setup container
+        if: matrix.name == 'linux-musl' && matrix.arch == 'arm64'
+        run: |
+          docker run -d --name alpine \
+            --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            alpine:latest \
+            tail -f /dev/null
+          docker exec alpine sh -c "apk update && apk add --no-cache gcc make sqlite musl-dev linux-headers"
+
+      - name: build sqlite-vector
+        run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make extension ${{ matrix.make && matrix.make || ''}}
+
+      - name: create keychain for codesign
+        if: matrix.os == 'macos-15'
+        run: |
+          echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > certificate.p12
+          security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+          security import certificate.p12 -k build.keychain -P "${{ secrets.CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+
+      - name: codesign dylib
+        if: matrix.os == 'macos-15' && matrix.name != 'apple-xcframework'
+        run: codesign --sign "${{ secrets.APPLE_TEAM_ID }}" --timestamp --options runtime dist/vector.dylib
+
+      - name: codesign and notarize xcframework
+        if: matrix.name == 'apple-xcframework'
+        run: |
+          find dist/vector.xcframework -name "*.framework" -exec echo "Signing: {}" \; -exec codesign --sign "${{ secrets.APPLE_TEAM_ID }}" --timestamp --options runtime {} \; # Sign each individual framework FIRST
+          codesign --sign "${{ secrets.APPLE_TEAM_ID }}" --timestamp --options runtime dist/vector.xcframework # Then sign the xcframework wrapper
+          ditto -c -k --keepParent dist/vector.xcframework dist/vector.xcframework.zip
+          xcrun notarytool submit dist/vector.xcframework.zip --apple-id "${{ secrets.APPLE_ID }}" --password "${{ secrets.APPLE_PASSWORD }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --wait
+          rm dist/vector.xcframework.zip
+
+      - name: cleanup keychain for codesign
+        if: matrix.os == 'macos-15'
+        run: |
+          rm certificate.p12
+          security delete-keychain build.keychain
 
       - name: android setup test environment
         if: matrix.name == 'android' && matrix.arch != 'arm64-v8a'
@@ -77,7 +132,7 @@ jobs:
           export ${{ matrix.make }}
           $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.arch }}-linux-android26-clang sqlite-amalgamation-*/shell.c sqlite-amalgamation-*/sqlite3.c -o sqlite3 -ldl
           # remove unused folders to save up space
-          rm -rf sqlite-amalgamation-*.zip sqlite-amalgamation-* openssl
+          rm -rf sqlite-amalgamation-*.zip sqlite-amalgamation-*
           echo "::endgroup::"
 
           echo "::group::prepare the test script"
@@ -102,8 +157,8 @@ jobs:
             adb shell "sh /data/local/tmp/commands.sh"
 
       - name: test sqlite-vector
-        if: matrix.name == 'linux' || matrix.name == 'windows' || matrix.name == 'macos'
-        run: make test
+        if: contains(matrix.name, 'linux') || matrix.name == 'windows' || matrix.name == 'macos'
+        run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make test ${{ matrix.make && matrix.make || ''}}
 
       - uses: actions/upload-artifact@v4.6.2
         if: always()
@@ -113,7 +168,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     name: release
     needs: build
     if: github.ref == 'refs/heads/main'
@@ -132,8 +187,7 @@ jobs:
       - name: release tag version from sqlite-vector.h
         id: tag
         run: |
-          FILE="src/sqlite-vector.h"
-          VERSION=$(grep -oP '#define SQLITE_VECTOR_VERSION\s+"\K[^"]+' "$FILE")
+          VERSION=$(make version)
           if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             LATEST=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.name')
             if [[ "$VERSION" != "$LATEST" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
@@ -151,9 +205,10 @@ jobs:
           for folder in "artifacts"/*; do
             if [ -d "$folder" ]; then
               name=$(basename "$folder")
-              zip -jq "${name}-${{ steps.tag.outputs.version }}.zip" "$folder"/*
-              tar -cJf "${name}-${{ steps.tag.outputs.version }}.tar.xz" -C "$folder" .
-              tar -czf "${name}-${{ steps.tag.outputs.version }}.tar.gz" -C "$folder" .
+              if [[ "$name" != "vector-apple-xcframework" ]]; then
+                tar -czf "${name}-${{ steps.tag.outputs.version }}.tar.gz" -C "$folder" .
+              fi
+              (cd "$folder" && zip -rq "../../${name}-${{ steps.tag.outputs.version }}.zip" .)
             fi
           done
 
@@ -164,6 +219,5 @@ jobs:
           tag_name: ${{ steps.tag.outputs.version }}
           files: |
             vector-*-${{ steps.tag.outputs.version }}.zip
-            vector-*-${{ steps.tag.outputs.version }}.tar.xz
             vector-*-${{ steps.tag.outputs.version }}.tar.gz
           make_latest: true
