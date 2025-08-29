@@ -21,7 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#ifdef _WIN32
+#if defined(_WIN32) || ((defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__)))
 char *strcasestr(const char *haystack, const char *needle) {
     if (!haystack || !needle) return NULL;
     if (!*needle) return (char *)haystack;
