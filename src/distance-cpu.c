@@ -732,15 +732,21 @@ float int8_distance_l1_cpu (const void *v1, const void *v2, int n) {
         return true;
     }
     #else
-    #include <sys/auxv.h>
-    #include <asm/hwcap.h>
-    bool cpu_supports_neon (void) {
-        #ifdef AT_HWCAP
-        return (getauxval(AT_HWCAP) & HWCAP_NEON) != 0;
+        #ifdef SQLITE_WASM_EXTRA_INIT
+        bool cpu_supports_neon (void) {
+            return false;
+        }
         #else
-        return false;
+        #include <sys/auxv.h>
+        #include <asm/hwcap.h>
+        bool cpu_supports_neon (void) {
+            #ifdef AT_HWCAP
+            return (getauxval(AT_HWCAP) & HWCAP_NEON) != 0;
+            #else
+            return false;
+            #endif
+        }
         #endif
-    }
     #endif
 #endif
 

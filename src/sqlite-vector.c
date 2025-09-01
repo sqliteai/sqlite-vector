@@ -21,7 +21,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#if defined(_WIN32) || ((defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__)))
+#if defined(_WIN32) || ((defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__))) || defined(SQLITE_WASM_EXTRA_INIT)
+// Provide strcasestr function implementation for environments that lack it:
+// - Windows (MinGW, MSVC, etc.)
+// - Linux with non-glibc C libraries (musl, uclibc, etc.)
+// - WebAssembly builds
 char *strcasestr(const char *haystack, const char *needle) {
     if (!haystack || !needle) return NULL;
     if (!*needle) return (char *)haystack;
