@@ -1,4 +1,4 @@
-name: build, test and release sqlite-vector
+name: Build, Test and Release
 on:
   push:
   workflow_dispatch:

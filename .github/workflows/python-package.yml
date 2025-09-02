@@ -7,11 +7,16 @@ on:
         description: "Version to use for the Python package (e.g. 0.9.9)"
         required: true
         type: string
-  release:
-    types: [released]
+  workflow_run:
+    workflows: ["Build, Test and Release"]
+    types:
+      - completed
 
 jobs:
   build-and-publish:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
     runs-on: ${{ matrix.os }}
     permissions:
       id-token: write  # mandatory for Pypi trusted publishing
@@ -65,8 +70,13 @@ jobs:
       - name: Get version
         id: get_version
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            VERSION="${{ github.event.release.tag_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Fetch latest published release tag from GitHub API
+            VERSION=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name')
+            if [ "$VERSION" = "null" ] || [ -z "$VERSION" ]; then
+              echo "Error: Failed to get latest release version"
+              exit 1
+            fi
           else
             VERSION="${{ github.event.inputs.version }}"
           fi
