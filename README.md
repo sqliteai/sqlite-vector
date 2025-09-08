@@ -40,6 +40,10 @@ Download the appropriate pre-built binary for your platform from the official [R
 - Android
 - iOS
 
+### WASM Version
+
+You can download the WebAssembly (WASM) version of SQLite with the SQLite Vector extension enabled from: https://www.npmjs.com/package/@sqliteai/sqlite-wasm
+
 ### Loading the Extension
 
 ```sql
