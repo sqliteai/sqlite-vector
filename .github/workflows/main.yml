@@ -199,8 +199,30 @@ jobs:
           fi
           echo "❌ SQLITE_VECTOR_VERSION not found in sqlite-vector.h"
           exit 1
+
+      - uses: actions/checkout@v4.2.2
+        if: steps.tag.outputs.version != ''
+        with:
+          repository: sqliteai/sqlite-wasm
+          path: sqlite-wasm
+          submodules: recursive
+          token: ${{ secrets.PAT }}
+
+      - name: release sqlite-wasm
+        if: steps.tag.outputs.version != ''
+        run: |
+          cd sqlite-wasm
+          git config --global user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          git config --global user.name "$GITHUB_ACTOR"
+          cd modules/sqlite-vector
+          git checkout ${{ github.sha }}
+          cd ../..
+          git add modules/sqlite-vector
+          git commit -m "Bump sqlite-vector version to ${{ steps.tag.outputs.version }}"
+          git push origin main
           
       - name: zip artifacts
+        if: steps.tag.outputs.version != ''
         run: |
           for folder in "artifacts"/*; do
             if [ -d "$folder" ]; then
