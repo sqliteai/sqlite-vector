@@ -1247,6 +1247,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
                     rc = SQLITE_ERROR;
                     goto vector_rebuild_quantization_cleanup;
             }
+
             if (val < min_val) min_val = val;
             if (val > max_val) max_val = val;
             if (val < 0.0) contains_negative = true;
@@ -1425,7 +1426,7 @@ static int vector_quantize (sqlite3_context *context, const char *table_name, co
     rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
     if (rc != SQLITE_OK) goto quantize_cleanup;
     
-    vector_options options = vector_options_create();
+    vector_options options = t_ctx->options; // t_ctx guarantees to exist
     bool res = parse_keyvalue_string(context, arg_options, vector_keyvalue_callback, &options);
     if (res == false) return SQLITE_ERROR;
     
@@ -2270,15 +2271,6 @@ static int vStreamScanBestIndex (sqlite3_vtab *tab, sqlite3_index_info *pIdxInfo
                 break;
         }
     }
-    return SQLITE_OK;
-}
-
-static int vStreamScanCursorOpen (sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
-    int rc = vFullScanCursorOpen(pVtab, ppCursor);
-    if (rc != SQLITE_OK) return rc;
-    
-    vFullScanCursor *c = (vFullScanCursor *)*ppCursor;
-    c->is_streaming = true;
     return SQLITE_OK;
 }
 
