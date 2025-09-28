@@ -34,7 +34,7 @@ conn = sqlite3.connect("example.db")
 
 # Load the sqlite-vector extension
 # pip will install the correct binary package for your platform and architecture
-ext_path = importlib.resources.files("sqlite_vector.binaries") / "vector"
+ext_path = importlib.resources.files("sqlite-vector.binaries") / "vector"
 
 conn.enable_load_extension(True)
 conn.load_extension(str(ext_path))
