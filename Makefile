@@ -42,7 +42,7 @@ OBJ_FILES = $(patsubst %.c, $(BUILD_DIR)/%.o, $(notdir $(SRC_FILES)))
 # Platform-specific settings
 ifeq ($(PLATFORM),windows)
 	TARGET := $(DIST_DIR)/vector.dll
-	LDFLAGS += -shared
+	LDFLAGS += -shared -static-libgcc
 	# Create .def file for Windows
 	DEF_FILE := $(BUILD_DIR)/vector.def
 	STRIP = strip --strip-unneeded $@
