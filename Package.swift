@@ -5,7 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "vector",
-    platforms: [.macOS(.v11), .iOS(.v11)],
+    platforms: [.macOS(.v11), .iOS(.v12)],
     products: [
         .library(
             name: "vector",
