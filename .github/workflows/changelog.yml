@@ -1,0 +1,30 @@
+name: Release and Update Website Changelog
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      test_version:
+        description: "The fake version to test (e.g., 99.9.9)"
+        required: true
+        default: "99.9.9"
+
+jobs:
+  release:
+    # Repo default is read-only; the called workflow needs write, and a reusable
+    # workflow can never hold more than its caller.
+    permissions:
+      contents: write
+      issues: write
+    # Pin to a reviewed release tag (or, strongest, a full commit SHA) — not @main. See "Security" below.
+    uses: sqlitecloud/changelog-action/.github/workflows/action.yml@v1
+    with:
+      name: "SQLite-Vector"
+      stage_branch: ${{ vars.WEBSITE_STAGE_BRANCH }} # staging branch changelog PRs target
+      create_release: false
+    secrets:
+      personal_access_token: ${{ secrets.WEBSITE_REPO_PAT }}
+      website_repo: ${{ secrets.WEBSITE_REPO }}
+      website_changelog_dir: ${{ secrets.WEBSITE_CHANGELOG_DIR }}
