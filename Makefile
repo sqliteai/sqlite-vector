@@ -181,6 +181,33 @@ unittest-simd: $(BUILD_DIR)/backend $(BUILD_DIR)/test_vector_simd
 	$(RUNNER) ./$(BUILD_DIR)/backend $(EXPECT_BACKEND)
 	$(RUNNER) ./$(BUILD_DIR)/test_vector_simd
 
+# Brute-force k-NN benchmark across every storage and quantization mode, with recall
+# measured against the exact scan. Built at -O3 with the same per-unit ISA flags as the
+# shipped extension, so it measures the kernels that actually ship.
+#
+#   make benchmark                                    k=20 over 1M vectors of dim 768
+#   make benchmark NVECS=100000 DIM=384 K=10          smaller, for a quick look
+#   make benchmark DISTANCE=l2                        a different metric
+NVECS ?= 1000000
+DIM ?= 768
+K ?= 20
+NQUERIES ?= 20
+DISTANCE ?= cosine
+
+BENCH_OBJ = $(patsubst %.c, $(BUILD_DIR)/bm-%.o, $(notdir $(SRC_FILES))) $(BUILD_DIR)/bm-sqlite3.o
+
+$(BUILD_DIR)/bm-distance-avx2.o: ISA_CFLAGS := $(AVX2_CFLAGS)
+$(BUILD_DIR)/bm-distance-avx512.o: ISA_CFLAGS := $(AVX512_CFLAGS)
+
+$(BUILD_DIR)/bm-%.o: %.c
+	$(CC) $(CFLAGS) $(ISA_CFLAGS) -DSQLITE_CORE -O3 -c $< -o $@
+
+$(BUILD_DIR)/benchmark: test/benchmark.c $(BENCH_OBJ)
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O3 -DNVECS=$(NVECS) -DDIM=$(DIM) -DK=$(K) -DNQUERIES=$(NQUERIES) -DDISTANCE='"$(DISTANCE)"' $< $(BENCH_OBJ) -o $@ -lm -lpthread
+
+benchmark: $(BUILD_DIR)/benchmark
+	./$(BUILD_DIR)/benchmark
+
 # Clean up generated files
 clean:
 	rm -rf $(BUILD_DIR)/* $(DIST_DIR)/* *.gcda *.gcno *.gcov *.sqlite

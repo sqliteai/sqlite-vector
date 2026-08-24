@@ -145,6 +145,70 @@ SELECT e.id, v.distance FROM images AS e
    LIMIT 10;
 ```
 
+## Benchmark
+
+Every number below comes from one command, so you can reproduce it and compare machines:
+
+```bash
+make benchmark
+```
+
+That builds `test/benchmark.c` at `-O3` with the same per-translation-unit SIMD flags the
+shipped extension uses, then searches **k=20 over 1,000,000 vectors of dimension 768**
+with cosine distance, 20 queries, reporting the best. Recall is the overlap with the exact
+full-precision top-20. Override any of it:
+
+```bash
+make benchmark NVECS=100000 DIM=384 K=10 DISTANCE=l2
+```
+
+### Apple M5 Pro (6P+12E, 64 GB, macOS 26.6.2) — NEON backend
+
+| Mode | Index | ms/query | Mvec/s | Recall@20 |
+| --- | ---: | ---: | ---: | ---: |
+| `FLOAT32` exact | 2930 MB | 147.8 | 6.8 | 100.0% |
+| `UINT8` | 740 MB | 55.4 | 18.0 | 33.8% |
+| `UINT8` preloaded | 740 MB | 37.2 | 26.9 | 33.8% |
+| `INT8` | 740 MB | 56.4 | 17.7 | 99.5% |
+| **`INT8` preloaded** | **740 MB** | **37.7** | **26.5** | **99.5%** |
+| `1BIT` | 99 MB | 5.3 | 187.5 | 10.0% |
+| `1BIT` preloaded | 99 MB | 2.7 | 377.6 | 10.0% |
+| `TURBO2` | 195 MB | 53.0 | 18.9 | 45.2% |
+| `TURBO2` preloaded | 195 MB | 48.2 | 20.7 | 45.2% |
+| `TURBO4` | 378 MB | 160.4 | 6.2 | 81.8% |
+| `TURBO4` preloaded | 378 MB | 151.8 | 6.6 | 81.8% |
+
+*Contributions from other CPUs welcome — run the command above and open a PR adding a
+section.*
+
+### Reading the table
+
+**The data is uniform random**, which is the worst case for every quantizer: real
+embeddings have structure that quantization exploits, so recall on your own vectors will
+be higher, often much higher. Treat the recall column as a floor and a way to rank the
+modes against each other, not as a prediction for your dataset.
+
+Three things are worth knowing before you pick a mode.
+
+**For cosine, use `INT8`, not `UINT8`.** They cost exactly the same and store exactly the
+same number of bytes, but `UINT8` recall collapses to 33.8% while `INT8` holds 99.5%.
+Unsigned quantization subtracts the dataset minimum before scaling, and cosine measures
+angle, which that shift destroys. `UINT8` is the right choice for L2, where a common
+translation cancels out. If you do not set `qtype`, the extension picks `UINT8` for
+non-negative data and `INT8` otherwise — which is the correct call for L2 and the wrong
+one for cosine, so set it explicitly when you use cosine.
+
+**`1BIT` is a filter, not an answer.** 377 Mvec/s and 30x less memory, at 10% recall on
+this data. It earns its place as a first pass whose survivors you re-rank at full
+precision, not as the final ranking.
+
+**TurboQuant trades speed for size, not for speed.** `TURBO4` here is *slower* than the
+exact scan (160 ms against 148 ms) while using 8x less memory and returning 81.8% recall.
+The lookup-table scan is one table gather per row, and at dimension 768 that is 384
+gathers into a 393 KB table for every vector — already about one lookup per cycle, so
+there is no headroom left in the current storage layout. Choose TurboQuant when the
+memory budget is what binds; choose `INT8` when throughput is.
+
 ## TurboQuant Benchmark and Recall
 
 TurboQuant can be selected with `qtype=TURBO,qbits=N`, where `N` is `2`, `3`, or `4`. Shorthand aliases are also available: `TURBO2`, `TURBO3`, and `TURBO4`.
@@ -157,13 +221,15 @@ SELECT vector_quantize('images', 'embedding', 'qtype=TURBO,qbits=4');
 SELECT vector_quantize('images', 'embedding', 'qtype=TURBO2');
 ```
 
-The following benchmark compares `vector_full_scan()` brute force against `vector_quantize_scan()` using TurboQuant on a synthetic dataset of **1,000,000 vectors**, **768 dimensions**, **DOT** distance, **k=10**, and **5 queries**. The database was file-backed, with raw vectors stored in SQLite and quantized data preloaded for the scan. Recall is measured as overlap with exact brute-force top-10 results. These numbers were measured on macOS ARM64 using the NEON backend; timings vary by CPU, storage, cache settings, and allocator behavior.
-
-| Mode | Quantized storage | Max RSS | Peak memory footprint | Full scan / query | TurboQuant / query | Speedup | Recall@10 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| TurboQuant 4-bit | 396 MB | ~488 MB | ~487 MB | 3248 ms | 218 ms | 14.92x | 0.84 |
-| TurboQuant 3-bit | 300 MB | ~394 MB | ~393 MB | 1727 ms | 188 ms | 9.19x | 0.74 |
-| TurboQuant 2-bit | 204 MB | ~310 MB | ~310 MB | 3265 ms | 85 ms | 38.27x | 0.48 |
+An earlier synthetic benchmark reported speedups of 15x for 4-bit and 38x for 2-bit
+against `vector_full_scan()`. Those numbers were measured with a **file-backed** database,
+where the full scan reads 3 GB of raw vectors off disk and the comparison is dominated by
+I/O rather than by arithmetic — and before the distance kernels were rewritten, which made
+the full-precision scan itself substantially faster. Against an in-memory baseline on
+current code the picture is different: see [Benchmark](#benchmark) below, where `TURBO4`
+is marginally slower than the exact scan and its argument is memory, not speed. Both
+measurements are real; they answer different questions. If your working set does not fit
+in RAM, the file-backed comparison is the one that describes your deployment.
 
 For comparison, the raw `FLOAT32` vectors alone are about **3.07 GB** for 1M x 768 before SQLite row/page overhead. TurboQuant 4-bit reduces the scan representation to about **13%** of that raw vector payload, TurboQuant 3-bit to about **10%**, and TurboQuant 2-bit to about **7%**. Actual resident memory depends on whether the database is in-memory or file-backed, SQLite cache settings, preloading, page cache behavior, and the host allocator.
 
@@ -296,6 +362,19 @@ You can store your vectors as `BLOB` columns in ordinary tables. Supported forma
 
 Simply insert a vector as a binary blob into your table. No special table types or schemas are required.
 
+A stored column is quantized separately with `vector_quantize(table, column, 'qtype=...')`,
+which builds a compact index the scan reads instead of the raw vectors:
+
+| `qtype` | Bytes per dimension | Notes |
+| --- | ---: | --- |
+| `UINT8` | 1 | Asymmetric. Correct for L2; see the [benchmark](#benchmark) before using it with cosine |
+| `INT8` | 1 | Symmetric. The default choice for cosine |
+| `1BIT` | 1/8 | Hamming only. A pre-filter to re-rank, not a final ranking |
+| `TURBO2` / `TURBO3` / `TURBO4` | 1/4, 3/8, 1/2 | Lookup-table scan; smallest indexes, see [TurboQuant](#turboquant-benchmark-and-recall) |
+
+Omitting `qtype` picks `UINT8` for non-negative data and `INT8` otherwise. `BIT` columns
+are already binary, so `1BIT` is the only quantization they accept.
+
 
 ### Supported Distance Metrics
 
@@ -306,9 +385,14 @@ Optimized implementations available:
 * **L1 Distance (Manhattan)**
 * **Cosine Distance**
 * **Dot Product**
-* **Hamming Distance** (available only with 1bit vectors)
+* **Hamming Distance** (available only with 1bit vectors — `vector_init()` rejects it for any other type)
 
 These are implemented in pure C and optimized for SIMD when available, ensuring maximum performance on modern CPUs and mobile devices.
+
+If your embeddings are already unit length, say so with `normalized=1`: cosine on a
+`FLOAT32` column then reduces to `1 - dot`, dropping two thirds of the arithmetic from the
+inner loop for the same results. It is an assertion about your data, not a request — see
+[API.md](API.md#vector_inittable-column-options).
 
 ---
 
