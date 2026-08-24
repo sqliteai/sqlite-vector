@@ -406,21 +406,25 @@ static bool sqlite_table_is_without_rowid (sqlite3 *db, const char *table_name) 
 
 static char *sqlite_get_int_prikey_column (sqlite3 *db, const char *table_name) {
     char sql[STATIC_SQL_SIZE];
-    sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*), type, name FROM pragma_table_info('%q') WHERE pk > 0;", table_name);
+    // one row per PRIMARY KEY column. The statement takes no parameters: the old version
+    // both bound one anyway and read bare type/name columns alongside COUNT(*), which
+    // SQLite takes from an arbitrary row of the group.
+    sqlite3_snprintf(sizeof(sql), sql, "SELECT name, type FROM pragma_table_info('%q') WHERE pk > 0;", table_name);
     char *prikey = NULL;
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
-
         if (sqlite3_step(stmt) == SQLITE_ROW) {
-            int count = sqlite3_column_int(stmt, 0);
-            if (count == 1) {
-                const char *decl_type = (const char *)sqlite3_column_text(stmt, 1);
-                // see https://www.sqlite.org/datatype3.html (Determination Of Column Affinity)
-                if (decl_type && strcasestr(decl_type, "INT")) {
-                    prikey = sqlite_strdup((const char *)sqlite3_column_text(stmt, 2));
-                }
+            const char *name = (const char *)sqlite3_column_text(stmt, 0);
+            const char *decl_type = (const char *)sqlite3_column_text(stmt, 1);
+            // see https://www.sqlite.org/datatype3.html (Determination Of Column Affinity)
+            if (name && decl_type && strcasestr(decl_type, "INT")) prikey = sqlite_strdup(name);
+
+            // a composite primary key gives more than one row and cannot stand in for the
+            // rowid (step() invalidates name, so the copy has to be taken first)
+            if (prikey && sqlite3_step(stmt) != SQLITE_DONE) {
+                sqlite3_free(prikey);
+                prikey = NULL;
             }
         }
     }
@@ -601,36 +605,23 @@ static inline int8_t q_round_s8 (float s) {
     return (int8_t)(int)r;
 }
 
+// NOTE: these go through q_round_u8/q_round_s8 rather than casting first and clamping
+// after. Converting a float to int is undefined when the value is NaN or outside the
+// int range, and it does differ in practice: arm64 saturates, x86 yields INT_MIN. The
+// helpers clamp in float and only then cast, which is also what every other quantizer
+// below already did.
 static inline void quantize_float32_to_unsigned8bit (const float *v, uint8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
-        float s0 = (v[i]     - offset) * scale;
-        float s1 = (v[i + 1] - offset) * scale;
-        float s2 = (v[i + 2] - offset) * scale;
-        float s3 = (v[i + 3] - offset) * scale;
-
-        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
-        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
-        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
-        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
-
-        r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
-        r1 = r1 > 255 ? 255 : (r1 < 0 ? 0 : r1);
-        r2 = r2 > 255 ? 255 : (r2 < 0 ? 0 : r2);
-        r3 = r3 > 255 ? 255 : (r3 < 0 ? 0 : r3);
-
-        q[i]     = (uint8_t)r0;
-        q[i + 1] = (uint8_t)r1;
-        q[i + 2] = (uint8_t)r2;
-        q[i + 3] = (uint8_t)r3;
+        q[i]     = q_round_u8((v[i]     - offset) * scale);
+        q[i + 1] = q_round_u8((v[i + 1] - offset) * scale);
+        q[i + 2] = q_round_u8((v[i + 2] - offset) * scale);
+        q[i + 3] = q_round_u8((v[i + 3] - offset) * scale);
     }
 
     // Handle remaining elements
     for (; i < n; ++i) {
-        float scaled = (v[i] - offset) * scale;
-        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
-        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);
-        q[i] = (uint8_t)rounded;
+        q[i] = q_round_u8((v[i] - offset) * scale);
     }
 }
 
@@ -713,32 +704,14 @@ static inline void quantize_i8_to_unsigned8bit (const int8_t *v, uint8_t *q, flo
 static inline void quantize_float32_to_signed8bit (const float *v, int8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
-        float s0 = (v[i]     - offset) * scale;
-        float s1 = (v[i + 1] - offset) * scale;
-        float s2 = (v[i + 2] - offset) * scale;
-        float s3 = (v[i + 3] - offset) * scale;
-
-        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
-        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
-        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
-        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
-
-        r0 = r0 > 127 ? 127 : (r0 < -128 ? -128 : r0);
-        r1 = r1 > 127 ? 127 : (r1 < -128 ? -128 : r1);
-        r2 = r2 > 127 ? 127 : (r2 < -128 ? -128 : r2);
-        r3 = r3 > 127 ? 127 : (r3 < -128 ? -128 : r3);
-
-        q[i]     = (int8_t)r0;
-        q[i + 1] = (int8_t)r1;
-        q[i + 2] = (int8_t)r2;
-        q[i + 3] = (int8_t)r3;
+        q[i]     = q_round_s8((v[i]     - offset) * scale);
+        q[i + 1] = q_round_s8((v[i + 1] - offset) * scale);
+        q[i + 2] = q_round_s8((v[i + 2] - offset) * scale);
+        q[i + 3] = q_round_s8((v[i + 3] - offset) * scale);
     }
 
     for (; i < n; ++i) {
-        float scaled = (v[i] - offset) * scale;
-        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
-        rounded = rounded > 127 ? 127 : (rounded < -128 ? -128 : rounded);
-        q[i] = (int8_t)rounded;
+        q[i] = q_round_s8((v[i] - offset) * scale);
     }
 }
 
@@ -1922,6 +1895,19 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     }
     if (qtype != VECTOR_QUANT_TURBO) table_context_free_turbo_cache(t_ctx);
 
+    // A BIT column is already binary, so 8-bit quantization has nothing to scale: it wrote
+    // (dim+7)/8 bytes into a dim-byte slot and left the rest uninitialised. AUTO now means
+    // the identity 1BIT, and an explicit 8-bit request is refused. This used to fail with
+    // an unrelated message on a populated table and to silently record qtype=UINT8 on an
+    // empty one, which then applied to rows inserted later.
+    if (type == VECTOR_TYPE_BIT) {
+        if (qtype == VECTOR_QUANT_AUTO) qtype = VECTOR_QUANT_1BIT;
+        if (qtype != VECTOR_QUANT_1BIT) {
+            context_result_error(context, SQLITE_ERROR, "BIT vectors can only be quantized with qtype=1BIT");
+            return SQLITE_MISUSE;
+        }
+    }
+
     // compute size of a single quant, format is: rowid + quantized payload
     size_t q_size = quantized_row_bytes(qtype, dim, q_bits);
     if (q_size == 0) {
@@ -2121,7 +2107,10 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
                 case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)blob, data, offset, scale, dim, qtype); break;
                 case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)blob, data, offset, scale, dim, qtype); break;
                 case VECTOR_TYPE_I8: quantize_i8((const int8_t *)blob, data, offset, scale, dim, qtype); break;
-                case VECTOR_TYPE_BIT: memcpy(data, blob, (dim + 7) / 8); break; // BIT to 8-bit: just copy
+                // unreachable for new indexes (see the guard above), but one written by an
+                // older build can still be loaded: zero the slot so the bytes past the
+                // packed bits are never fed to a distance kernel uninitialised
+                case VECTOR_TYPE_BIT: memset(data, 0, (size_t)dim); memcpy(data, blob, (dim + 7) / 8); break;
             }
         }
         
@@ -2315,13 +2304,19 @@ static int vector_quantize (sqlite3_context *context, const char *table_name, co
     return SQLITE_OK;
     
 quantize_cleanup: {
-        const char *errmsg = sqlite3_errmsg(db);
+        // capture before the rollback, which resets the connection's error state
+        char *errmsg = (sqlite3_errcode(db) != SQLITE_OK) ? sqlite3_mprintf("%s", sqlite3_errmsg(db)) : NULL;
         if (savepoint_open) {
             sqlite3_exec(db, "ROLLBACK TO quantize;", NULL, NULL, NULL);
             sqlite3_exec(db, "RELEASE quantize;", NULL, NULL, NULL);
         }
         
-        sqlite3_result_error(context, errmsg, -1);
+        // only replace the message when SQLite actually has one: the callees set their own
+        // through context_result_error, and overwriting it reported "not an error"
+        if (errmsg) {
+            sqlite3_result_error(context, errmsg, -1);
+            sqlite3_free(errmsg);
+        }
         sqlite3_result_error_code(context, rc);
         return rc;
     }
@@ -2747,9 +2742,14 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
 
     // non-streaming flow
     int k = sqlite3_value_int(argv[3]);
-    if (k == 0) {
+    if (k <= 0) {
+        // an empty result, not an error: any non-OK return from xFilter is an error code
+        // to SQLite, and SQLITE_DONE only looked harmless because it happens to be the
+        // value sqlite3_step() reports at end of results
         if (vector_allocated) sqlite3_free((void *)vector);
-        return SQLITE_DONE;
+        c->row_index = 0;
+        c->row_count = 0;
+        return SQLITE_OK;
     }
 
     if (c->row_count != k) {
@@ -3449,7 +3449,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
             case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_I8: quantize_i8((const int8_t *)v1, v, offset, scale, dimension, qtype); break;
-            case VECTOR_TYPE_BIT: memcpy(v, v1, (dimension + 7) / 8); break; // BIT to 8-bit: just copy
+            case VECTOR_TYPE_BIT: memset(v, 0, (size_t)dimension); memcpy(v, v1, (dimension + 7) / 8); break; // see vector_rebuild_quantization
         }
     }
 
@@ -3706,7 +3706,7 @@ static int vStreamQuantCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v
             case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_I8: quantize_i8((const int8_t *)v1, v, offset, scale, dimension, qtype); break;
-            case VECTOR_TYPE_BIT: memcpy(v, v1, (dimension + 7) / 8); break; // BIT to 8-bit: just copy
+            case VECTOR_TYPE_BIT: memset(v, 0, (size_t)dimension); memcpy(v, v1, (dimension + 7) / 8); break; // see vector_rebuild_quantization
         }
     }
 
