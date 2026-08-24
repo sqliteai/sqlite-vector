@@ -6,10 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-24
+
+A source audit closed thirteen defects, including two crashes and four memory-safety
+issues, and found that every x86 release had been shipping scalar code. Search is
+substantially faster as a result, and the SIMD kernels are now actually tested.
+
+### Added
+
+- **`normalized=1` option for `vector_init()`**: declares that every stored vector is unit length. With `type=FLOAT32` and `distance=COSINE` a full-precision scan then computes `1 - dot` instead of the full cosine, dropping two thirds of the arithmetic from the inner loop. The query is normalized once per scan, so reported distances are unchanged. It is an assertion about your data, not a request: if the stored vectors are not unit length the distances will be wrong. Quantized scans ignore it.
+- **`make benchmark`**: brute-force k-NN benchmark across every storage and quantization mode, with recall scored against the exact scan. Defaults to k=20 over 1,000,000 vectors of dimension 768; see the Benchmark section of the README.
+- **`make unittest-simd`**: runs the test suite against the SIMD kernels. The existing `unittest` target builds every source in one invocation, which left `__AVX2__` and `__AVX512F__` undefined and silently exercised the scalar fallback instead.
+- **CI coverage for the AVX-512 kernels**, on hardware where the runner has it and under Intel SDE where it does not, with an assertion that the expected backend was the one that ran.
+
+### Changed
+
+- **x86 builds now contain the AVX2 and AVX-512 kernels.** They were guarded by `__AVX2__` / `__AVX512F__`, which the build never defined, so both compiled to nothing — and because the runtime dispatch was an `if / else if` ladder, a CPU reporting AVX2 called an empty stub and never fell back to the SSE2 kernels that were compiled in. Every x86 release so far ran the plain C fallback.
+- **Faster distance kernels.** The FLOAT32 kernels now use four independent accumulators and true FMA; the UINT8/INT8 kernels were rewritten around the instructions built for them (`vabd`/`vmull`/`vpadal` on NEON, `PSADBW`/`PMADDWD` on x86). AVX2 and AVX-512 cosine no longer makes three separate passes over the data. Measured on Apple M5 Pro at dimension 768, a preloaded quantized scan went from 17.4 to 62.6 Mvec/s. Accuracy improved as well: reductions widen to 64 bits before folding lanes, and integer cosine sums exact integers rather than accumulating in `float`.
+- **Faster top-k.** The candidate set is a binary max-heap instead of a linear rescan plus an exchange sort. At k=1000 over 20,000 rows a 1-bit scan went from 3.17 ms to 0.16 ms per query; at k=4000, from 33.5 ms to 0.55 ms. Small k is unchanged.
+- **TurboQuant lookup scans return the same distance on every CPU.** The per-backend implementations accumulated in `float` while the scalar one used `double`, so results differed by up to 1.5e-4 relative depending on which backend ran — enough to reorder near-ties. There is now one implementation.
+- **`vector_turboquant_backend()`** still returns the same strings, but the value identifies the SIMD tier selected at load time rather than a TurboQuant-specific code path, since there is only one.
+- **`qtype=AUTO` on a `BIT` column now means `1BIT`.** Previously it failed on a populated table with an unrelated message, and on an empty one silently recorded `UINT8`, which then applied to rows inserted later. An explicit 8-bit request on a `BIT` column is now refused with a message that says so.
+- **`distance=HAMMING` is rejected for any type other than `BIT`** at `vector_init()` time.
+
 ### Fixed
 
+- **Crash on `distance=HAMMING` with a non-`BIT` vector type.** The dispatch table only implements Hamming for `BIT`, and the combination was accepted, so scanning called a NULL function pointer.
+- **Out-of-bounds read from an undersized query vector.** A query passed as a `BLOB` was never length-checked, so the distance kernels read `dimension` elements from whatever the caller supplied. The JSON form already validated this.
+- **SQL injection through table and column names.** Identifiers were interpolated with `%q`, which escapes string literals and does nothing for `;` or `"`. A table whose name contains a semicolon could inject statements through `vector_quantize_cleanup()`. This also fixes ordinary names: tables or columns containing spaces or dashes previously failed with a syntax error and now work.
+- **`ORDER BY` was silently ignored** on `vector_full_scan()` and `vector_quantize_scan()`. The planner was told the cursor already satisfied any ordering, so SQLite dropped the sorter — including for `ORDER BY distance DESC`.
+- **Out-of-bounds reads on a malformed quantized index.** The `UINT8`/`INT8`/`1BIT` scan paths decoded rows without checking the blob against the row count it claimed. The shadow table is an ordinary writable table.
+- **Heap buffer overflow in `vector_quantize_preload()`.** The buffer was sized from `SUM(LENGTH(data))` and filled with no per-row bound. No concurrency was needed to trigger it: `LENGTH()` counts characters on a TEXT value while the byte length can be larger.
+- **Use-after-free when `vector_quantize_cleanup()` or `vector_quantize_preload()` ran while a streaming cursor was open.** The in-memory index is now reference counted, so a scan keeps reading a consistent snapshot.
+- **Double free on the extension-init error path**, which SQLite could reach immediately because it invokes the destructor when `sqlite3_create_function_v2()` itself fails.
+- **`k = 0`** returned an error code from `xFilter` instead of an empty result.
+- **Undefined float-to-int conversion** in the unrolled 8-bit quantizers for NaN and out-of-range values.
+- **Primary-key detection on `WITHOUT ROWID` tables** bound a parameter to a statement that has none and read columns from an arbitrary row of a grouped query.
+- **`vector_quantize()` reported "not an error"** whenever the failure came from the extension rather than from SQLite.
+- **Uninitialised bytes** in the index when a `BIT` column was quantized to 8 bits.
 - **GCC 13 build failure on AVX2 targets**: a static `__m256i` initializer is now built from a plain byte array, so the extension compiles with GCC 13's stricter constant-expression rules.
 - **Swift Package**: removed the deprecated `.iOS(.v11)` platform declaration that produced a warning (and, on recent toolchains, an error) when resolving the package.
+
+### Notes
+
+- **For cosine, prefer `qtype=INT8` over `UINT8`.** They are the same size and the same speed, but unsigned quantization subtracts the dataset minimum before scaling, and cosine measures angle, which that shift destroys. Omitting `qtype` selects `UINT8` for non-negative data, which is correct for L2 and wrong for cosine. See the Benchmark section of the README.
+- **Tie-breaking among equal distances changed** with the new top-k. Neither ordering was stable and none was guaranteed, but it is observable.
 
 ## [1.0.0] - 2026-05-25
 
