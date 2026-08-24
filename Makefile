@@ -102,6 +102,18 @@ ifneq (,$(findstring rv64,$(ARCH)))
 	CFLAGS += -march=$(ARCH)
 endif
 
+# The AVX2 and AVX-512 kernels are guarded by __AVX2__ / __AVX512F__, so without these
+# flags they compile to nothing and every x86 build falls back to the scalar kernels.
+# Enable the ISA for those two translation units only, so the baseline target of the
+# rest of the extension is unchanged: the runtime check in init_distance_functions()
+# still decides which set gets installed. Probing the compiler keeps this a no-op on
+# non-x86 targets and on multi-arch (universal) builds.
+AVX2_CFLAGS := $(shell $(CC) $(CFLAGS) -mavx2 -mfma -E -x c /dev/null >/dev/null 2>&1 && echo -mavx2 -mfma)
+AVX512_CFLAGS := $(shell $(CC) $(CFLAGS) -mavx512f -mavx512bw -mavx512vl -mavx512dq -E -x c /dev/null >/dev/null 2>&1 && echo -mavx512f -mavx512bw -mavx512vl -mavx512dq)
+
+$(BUILD_DIR)/distance-avx2.o: ISA_CFLAGS := $(AVX2_CFLAGS)
+$(BUILD_DIR)/distance-avx512.o: ISA_CFLAGS := $(AVX512_CFLAGS)
+
 # Windows .def file generation
 $(DEF_FILE):
 ifeq ($(PLATFORM),windows)
@@ -129,7 +141,7 @@ endif
 
 # Object files
 $(BUILD_DIR)/%.o: %.c
-	$(CC) $(CFLAGS) -O3 -fPIC -c $< -o $@
+	$(CC) $(CFLAGS) $(ISA_CFLAGS) -O3 -fPIC -c $< -o $@
 
 test: $(TARGET)
 	$(SQLITE3) ":memory:" -cmd ".bail on" ".load ./dist/vector" "SELECT vector_version();"
@@ -138,6 +150,36 @@ TEST_SRC = test/test_vector.c libs/sqlite3.c $(SRC_FILES)
 unittest:
 	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $(TEST_SRC) -o $(BUILD_DIR)/test_vector -lm -lpthread
 	./$(BUILD_DIR)/test_vector
+
+# The unittest target above builds every source in a single invocation, which leaves
+# __AVX2__ and __AVX512F__ undefined: those kernels compile to nothing and the suite
+# silently exercises the scalar fallback instead. This target compiles per translation
+# unit the way the extension does, so the SIMD backends are actually under test.
+#
+#   make unittest-simd                                    run on whatever this CPU supports
+#   make unittest-simd EXPECT_BACKEND=AVX512              fail unless AVX-512 was installed
+#   make unittest-simd RUNNER="sde64 -spr --"             run under an emulator
+UNITTEST_OBJ = $(patsubst %.c, $(BUILD_DIR)/ut-%.o, $(notdir $(SRC_FILES))) $(BUILD_DIR)/ut-sqlite3.o
+
+$(BUILD_DIR)/ut-distance-avx2.o: ISA_CFLAGS := $(AVX2_CFLAGS)
+$(BUILD_DIR)/ut-distance-avx512.o: ISA_CFLAGS := $(AVX512_CFLAGS)
+
+$(BUILD_DIR)/ut-%.o: %.c
+	$(CC) $(CFLAGS) $(ISA_CFLAGS) -DSQLITE_CORE -O2 -c $< -o $@
+
+$(BUILD_DIR)/backend: test/backend.c $(UNITTEST_OBJ)
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $< $(UNITTEST_OBJ) -o $@ -lm -lpthread
+
+$(BUILD_DIR)/test_vector_simd: test/test_vector.c $(UNITTEST_OBJ)
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $< $(UNITTEST_OBJ) -o $@ -lm -lpthread
+
+# RUNNER wraps both binaries, so an emulator sees the same build the assertion checked
+RUNNER ?=
+EXPECT_BACKEND ?=
+
+unittest-simd: $(BUILD_DIR)/backend $(BUILD_DIR)/test_vector_simd
+	$(RUNNER) ./$(BUILD_DIR)/backend $(EXPECT_BACKEND)
+	$(RUNNER) ./$(BUILD_DIR)/test_vector_simd
 
 # Clean up generated files
 clean:

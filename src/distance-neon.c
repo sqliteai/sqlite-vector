@@ -38,27 +38,48 @@ static inline uint16_t vmaxv_u16_compat(uint16x4_t v) {
 
 // MARK: FLOAT32 -
 
+// One accumulator turns the loop into a single dependency chain: FMLA has around four
+// cycles of latency, so the loop retires one vector every four cycles however many FMA
+// pipes the core has. Four independent accumulators keep them all fed.
+#if defined(__aarch64__) || defined(__ARM_FEATURE_FMA)
+#define VFMA_F32(_acc, _x, _y)              vfmaq_f32((_acc), (_x), (_y))
+#else
+#define VFMA_F32(_acc, _x, _y)              vmlaq_f32((_acc), (_x), (_y))
+#endif
+
+static inline float hsum_f32x4 (float32x4_t v) {
+    #if defined(__aarch64__)
+    return vaddvq_f32(v);
+    #else
+    float t[4];
+    vst1q_f32(t, v);
+    return t[0] + t[1] + t[2] + t[3];
+    #endif
+}
+
 float float32_distance_l2_impl_neon (const void *v1, const void *v2, int n, bool use_sqrt) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    float32x4_t acc = vdupq_n_f32(0.0f);
+
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     int i = 0;
 
+    for (; i <= n - 16; i += 16) {
+        float32x4_t d0 = vsubq_f32(vld1q_f32(a + i     ), vld1q_f32(b + i     ));
+        float32x4_t d1 = vsubq_f32(vld1q_f32(a + i +  4), vld1q_f32(b + i +  4));
+        float32x4_t d2 = vsubq_f32(vld1q_f32(a + i +  8), vld1q_f32(b + i +  8));
+        float32x4_t d3 = vsubq_f32(vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+        acc0 = VFMA_F32(acc0, d0, d0);
+        acc1 = VFMA_F32(acc1, d1, d1);
+        acc2 = VFMA_F32(acc2, d2, d2);
+        acc3 = VFMA_F32(acc3, d3, d3);
+    }
     for (; i <= n - 4; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        float32x4_t d  = vsubq_f32(va, vb);
-        acc = vmlaq_f32(acc, d, d);  // acc += d * d
+        float32x4_t d = vsubq_f32(vld1q_f32(a + i), vld1q_f32(b + i));
+        acc0 = VFMA_F32(acc0, d, d);
     }
 
-    float sum;
-    #if defined(__aarch64__)
-    sum = vaddvq_f32(acc);              // fast horizontal add on arm64
-    #else
-    float tmp[4]; vst1q_f32(tmp, acc);
-    sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    #endif
+    float sum = hsum_f32x4(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
     for (; i < n; ++i) {
         float d = a[i] - b[i];
@@ -79,29 +100,36 @@ float float32_distance_l2_squared_neon (const void *v1, const void *v2, int n) {
 float float32_distance_cosine_neon (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    float32x4_t acc_dot  = vdupq_n_f32(0.0f);
-    float32x4_t acc_a2   = vdupq_n_f32(0.0f);
-    float32x4_t acc_b2   = vdupq_n_f32(0.0f);
+
+    // three quantities x four accumulators: twelve independent chains, which aarch64's
+    // 32 vector registers hold without spilling
+    float32x4_t dot0 = vdupq_n_f32(0.0f), dot1 = dot0, dot2 = dot0, dot3 = dot0;
+    float32x4_t na0 = dot0, na1 = dot0, na2 = dot0, na3 = dot0;
+    float32x4_t nb0 = dot0, nb1 = dot0, nb2 = dot0, nb3 = dot0;
     int i = 0;
 
+    for (; i <= n - 16; i += 16) {
+        float32x4_t a0 = vld1q_f32(a + i), a1 = vld1q_f32(a + i + 4);
+        float32x4_t a2 = vld1q_f32(a + i + 8), a3 = vld1q_f32(a + i + 12);
+        float32x4_t b0 = vld1q_f32(b + i), b1 = vld1q_f32(b + i + 4);
+        float32x4_t b2 = vld1q_f32(b + i + 8), b3 = vld1q_f32(b + i + 12);
+        dot0 = VFMA_F32(dot0, a0, b0);  dot1 = VFMA_F32(dot1, a1, b1);
+        dot2 = VFMA_F32(dot2, a2, b2);  dot3 = VFMA_F32(dot3, a3, b3);
+        na0  = VFMA_F32(na0,  a0, a0);  na1  = VFMA_F32(na1,  a1, a1);
+        na2  = VFMA_F32(na2,  a2, a2);  na3  = VFMA_F32(na3,  a3, a3);
+        nb0  = VFMA_F32(nb0,  b0, b0);  nb1  = VFMA_F32(nb1,  b1, b1);
+        nb2  = VFMA_F32(nb2,  b2, b2);  nb3  = VFMA_F32(nb3,  b3, b3);
+    }
     for (; i <= n - 4; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-
-        acc_dot = vmlaq_f32(acc_dot, va, vb);      // dot += a * b
-        acc_a2  = vmlaq_f32(acc_a2, va, va);       // norm_a += a * a
-        acc_b2  = vmlaq_f32(acc_b2, vb, vb);       // norm_b += b * b
+        float32x4_t va = vld1q_f32(a + i), vb = vld1q_f32(b + i);
+        dot0 = VFMA_F32(dot0, va, vb);
+        na0  = VFMA_F32(na0,  va, va);
+        nb0  = VFMA_F32(nb0,  vb, vb);
     }
 
-    float d[4], a2[4], b2[4];
-    vst1q_f32(d, acc_dot);
-    vst1q_f32(a2, acc_a2);
-    vst1q_f32(b2, acc_b2);
-
-    float dot = d[0] + d[1] + d[2] + d[3];
-    float norm_a = a2[0] + a2[1] + a2[2] + a2[3];
-    float norm_b = b2[0] + b2[1] + b2[2] + b2[3];
+    float dot    = hsum_f32x4(vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3)));
+    float norm_a = hsum_f32x4(vaddq_f32(vaddq_f32(na0, na1), vaddq_f32(na2, na3)));
+    float norm_b = hsum_f32x4(vaddq_f32(vaddq_f32(nb0, nb1), vaddq_f32(nb2, nb3)));
 
     for (; i < n; ++i) {
         float ai = a[i];
@@ -121,19 +149,21 @@ float float32_distance_cosine_neon (const void *v1, const void *v2, int n) {
 float float32_distance_dot_neon (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    float32x4_t acc = vdupq_n_f32(0.0f);
+
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     int i = 0;
 
+    for (; i <= n - 16; i += 16) {
+        acc0 = VFMA_F32(acc0, vld1q_f32(a + i     ), vld1q_f32(b + i     ));
+        acc1 = VFMA_F32(acc1, vld1q_f32(a + i +  4), vld1q_f32(b + i +  4));
+        acc2 = VFMA_F32(acc2, vld1q_f32(a + i +  8), vld1q_f32(b + i +  8));
+        acc3 = VFMA_F32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
     for (; i <= n - 4; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        acc = vmlaq_f32(acc, va, vb);  // acc += a * b
+        acc0 = VFMA_F32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
     }
 
-    float tmp[4];
-    vst1q_f32(tmp, acc);
-    float dot = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+    float dot = hsum_f32x4(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
     for (; i < n; ++i) {
         dot += a[i] * b[i];
@@ -145,20 +175,21 @@ float float32_distance_dot_neon (const void *v1, const void *v2, int n) {
 float float32_distance_l1_neon (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    float32x4_t acc = vdupq_n_f32(0.0f);
+
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     int i = 0;
 
+    for (; i <= n - 16; i += 16) {
+        acc0 = vaddq_f32(acc0, vabdq_f32(vld1q_f32(a + i     ), vld1q_f32(b + i     )));
+        acc1 = vaddq_f32(acc1, vabdq_f32(vld1q_f32(a + i +  4), vld1q_f32(b + i +  4)));
+        acc2 = vaddq_f32(acc2, vabdq_f32(vld1q_f32(a + i +  8), vld1q_f32(b + i +  8)));
+        acc3 = vaddq_f32(acc3, vabdq_f32(vld1q_f32(a + i + 12), vld1q_f32(b + i + 12)));
+    }
     for (; i <= n - 4; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        float32x4_t d  = vabdq_f32(va, vb);  // |a - b|
-        acc = vaddq_f32(acc, d);
+        acc0 = vaddq_f32(acc0, vabdq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
     }
 
-    float tmp[4];
-    vst1q_f32(tmp, acc);
-    float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+    float sum = hsum_f32x4(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
     for (; i < n; ++i) {
         sum += fabsf(a[i] - b[i]);
@@ -1328,7 +1359,7 @@ float turbo_lut_dot_neon (const uint8_t *packed, float scale, const float *query
 
 // MARK: -
 
-void init_distance_functions_neon (void) {
+bool init_distance_functions_neon (void) {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F32] = float32_distance_l2_neon;
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F16] = float16_distance_l2_neon;
@@ -1365,5 +1396,8 @@ void init_distance_functions_neon (void) {
     distance_backend_name = "NEON";
     turbo_lut_dot_function = turbo_lut_dot_neon;
     turbo_lut_backend_name = "NEON";
+    return true;
+#else
+    return false;
 #endif
 }

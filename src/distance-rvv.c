@@ -1021,7 +1021,7 @@ float turbo_lut_dot_rvv (const uint8_t *packed, float scale, const float *query_
 
 // MARK: -
 
-void init_distance_functions_rvv (void) {
+bool init_distance_functions_rvv (void) {
 #if defined(__riscv_v_intrinsic)
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F32] = float32_distance_l2_rvv;
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F16] = float16_distance_l2_rvv;
@@ -1058,5 +1058,8 @@ void init_distance_functions_rvv (void) {
     distance_backend_name = "RVV";
     turbo_lut_dot_function = turbo_lut_dot_rvv;
     turbo_lut_backend_name = "RVV";
+    return true;
+#else
+    return false;
 #endif
 }

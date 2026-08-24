@@ -203,6 +203,69 @@ jobs:
           path: dist/vector.*
           if-no-files-found: error
 
+  avx512:
+    # The AVX-512 kernels are compiled out of every other job: the plain `unittest` target
+    # builds all sources in one invocation, so __AVX512F__ is undefined and the suite
+    # silently exercises the scalar fallback. This job builds them for real and asserts
+    # which backend was installed, so a fallback fails instead of passing quietly.
+    #
+    # GitHub's hosted fleet is mixed - some runners have AVX-512, some do not, and there
+    # is no way to request one (actions/runner#1069). When this runner has it we run the
+    # kernels natively; otherwise we run them under Intel SDE, which emulates the ISA
+    # deterministically. Either way EXPECT_BACKEND makes the job fail if AVX-512 is not
+    # what actually ran.
+    name: avx512 kernels
+    if: ${{ !contains(github.event.head_commit.message, '[auto-update]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Intel SDE, from Intel's own download mirror. Bump both together; the job fails on
+      # a checksum mismatch rather than running an unverified binary.
+      SDE_URL: https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+      SDE_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: does this runner have AVX-512?
+        id: cpu
+        run: |
+          grep -m1 '^model name' /proc/cpuinfo
+          missing=""
+          for f in avx512f avx512bw avx512vl avx512dq; do
+            grep -qw "$f" /proc/cpuinfo || missing="$missing $f"
+          done
+          if [ -z "$missing" ]; then
+            echo "native=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=AVX-512::this runner has AVX-512, running the kernels on hardware"
+          else
+            echo "native=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=AVX-512::this runner is missing$missing, running the kernels under Intel SDE"
+          fi
+
+      - name: install Intel SDE
+        if: steps.cpu.outputs.native == 'false'
+        run: |
+          curl -fsSL -o /tmp/sde.tar.xz "$SDE_URL"
+          echo "$SDE_SHA256  /tmp/sde.tar.xz" | sha256sum -c -
+          mkdir -p /tmp/sde
+          tar -xJf /tmp/sde.tar.xz -C /tmp/sde --strip-components=1
+          /tmp/sde/sde64 --version | head -2
+
+      - name: run the suite on the AVX-512 kernels
+        run: |
+          if [ "${{ steps.cpu.outputs.native }}" = "true" ]; then
+            make unittest-simd EXPECT_BACKEND=AVX512
+          else
+            make unittest-simd EXPECT_BACKEND=AVX512 RUNNER="/tmp/sde/sde64 -skx --"
+          fi
+
+      - name: run the suite on the AVX2 kernels
+        # Only meaningful where AVX-512 is absent: the runtime check prefers AVX-512
+        # whenever the CPU has it, so asserting AVX2 there would correctly fail. Cheap
+        # extra coverage either way - until now no job built these kernels at all.
+        if: steps.cpu.outputs.native == 'false'
+        run: make unittest-simd EXPECT_BACKEND=AVX2
+
   release:
     runs-on: ubuntu-22.04
     name: release

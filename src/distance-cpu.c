@@ -822,7 +822,10 @@ float bit1_distance_hamming_cpu (const void *v1, const void *v2, int n) {
             bool has_avx512bw = (cpu_info[1] & (1 << 30));
             bool has_avx512vl = (cpu_info[1] & (1 << 31));
 
-            return has_avx512f && has_avx512bw && has_avx512vl;
+            // EBX Bit 17: AVX512DQ, needed by _mm512_extractf32x8_ps in the f16/bf16 kernels
+            bool has_avx512dq = (cpu_info[1] & (1 << 17));
+
+            return has_avx512f && has_avx512bw && has_avx512vl && has_avx512dq;
         #endif
     }
 
@@ -942,16 +945,15 @@ void init_distance_functions (bool force_cpu) {
     init_cpu_functions();
     if (force_cpu) return;
     
+    // each backend reports whether its kernels were actually compiled into this build:
+    // a tier whose ISA was not enabled at compile time installs nothing and we must keep
+    // walking down, otherwise an AVX2-capable CPU would end up on the scalar fallback
+    // even though the SSE2 kernels are available
     #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    if (cpu_supports_avx512()) {
-        init_distance_functions_avx512();
-    }
-    else if (cpu_supports_avx2()) {
-        init_distance_functions_avx2();
-    }
-    else if (cpu_supports_sse2()) {
-        init_distance_functions_sse2();
-    }
+    bool installed = false;
+    if (!installed && cpu_supports_avx512()) installed = init_distance_functions_avx512();
+    if (!installed && cpu_supports_avx2()) installed = init_distance_functions_avx2();
+    if (!installed && cpu_supports_sse2()) installed = init_distance_functions_sse2();
     #elif defined(__ARM_NEON) || defined(__aarch64__)
     if (cpu_supports_neon()) {
         init_distance_functions_neon();

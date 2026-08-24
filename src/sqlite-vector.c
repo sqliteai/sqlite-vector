@@ -122,6 +122,17 @@ SQLITE_EXTENSION_INIT1
 
 typedef struct turbo_rotation_plan turbo_rotation_plan;
 
+// Reference-counted snapshot of the in-memory quantized index. A scan holds a reference
+// for as long as it walks the buffer - streaming cursors keep it across many xNext calls -
+// so vector_quantize_preload() and vector_quantize_cleanup() can replace or drop the
+// table's copy without freeing memory a running scan is still reading.
+typedef struct {
+    int             refcount;               // guarded by qmutex
+    int             counter;                // number of quantized vectors in data
+    sqlite3_int64   bytes;                  // usable bytes in data
+    uint8_t         data[];
+} preload_index;
+
 typedef struct {
     vector_type     v_type;                 // vector type
     int             v_dim;                  // vector dimension
@@ -143,9 +154,7 @@ typedef struct {
     float           offset;                 // computed value by quantization
     bool            binary_mean;            // binary mean option for 1BIT quantization
     
-    void            *preloaded;
-    int             precounter;
-    sqlite3_int64   preloaded_bytes;
+    preload_index   *preloaded;             // owned reference, guarded by qmutex
 
     turbo_rotation_plan *turbo_plan;
     int             turbo_plan_dim;
@@ -194,6 +203,7 @@ typedef struct {
         float               *turbo_query_lut;
         float               *turbo_norm_lut;
         int                 turbo_lut_rows;
+        preload_index       *preload_ref;   // reference held while data points into it
     } stream;
     
     // NON-STREAMING VT INTERFACE
@@ -214,6 +224,49 @@ extern const char *distance_backend_name;
 extern const char *turbo_lut_backend_name;
 
 static sqlite3_mutex *qmutex;
+
+// MARK: - Preloaded Index -
+
+static preload_index *preload_index_new (sqlite3_int64 bytes) {
+    if (bytes <= 0) return NULL;
+    preload_index *idx = (preload_index *)sqlite3_malloc64(sizeof(preload_index) + (sqlite3_uint64)bytes);
+    if (!idx) return NULL;
+
+    idx->refcount = 1;
+    idx->counter = 0;
+    idx->bytes = bytes;
+    return idx;
+}
+
+static void preload_index_release (preload_index *idx) {
+    if (!idx) return;
+
+    sqlite3_mutex_enter(qmutex);
+    int refs = --idx->refcount;
+    sqlite3_mutex_leave(qmutex);
+
+    if (refs == 0) sqlite3_free(idx);
+}
+
+// borrow the table's index for the duration of a scan (NULL if nothing is preloaded)
+static preload_index *preload_index_acquire (table_context *t_ctx) {
+    sqlite3_mutex_enter(qmutex);
+    preload_index *idx = t_ctx->preloaded;
+    if (idx) ++idx->refcount;
+    sqlite3_mutex_leave(qmutex);
+
+    return idx;
+}
+
+// hand a new index (or NULL) to the table and drop the reference to the previous one
+static void preload_index_install (table_context *t_ctx, preload_index *idx) {
+    sqlite3_mutex_enter(qmutex);
+    preload_index *old = t_ctx->preloaded;
+    t_ctx->preloaded = idx;
+    sqlite3_mutex_leave(qmutex);
+
+    preload_index_release(old);
+}
 
 // MARK: - SQLite Utils -
 
@@ -353,21 +406,25 @@ static bool sqlite_table_is_without_rowid (sqlite3 *db, const char *table_name) 
 
 static char *sqlite_get_int_prikey_column (sqlite3 *db, const char *table_name) {
     char sql[STATIC_SQL_SIZE];
-    sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*), type, name FROM pragma_table_info('%q') WHERE pk > 0;", table_name);
+    // one row per PRIMARY KEY column. The statement takes no parameters: the old version
+    // both bound one anyway and read bare type/name columns alongside COUNT(*), which
+    // SQLite takes from an arbitrary row of the group.
+    sqlite3_snprintf(sizeof(sql), sql, "SELECT name, type FROM pragma_table_info('%q') WHERE pk > 0;", table_name);
     char *prikey = NULL;
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
-
         if (sqlite3_step(stmt) == SQLITE_ROW) {
-            int count = sqlite3_column_int(stmt, 0);
-            if (count == 1) {
-                const char *decl_type = (const char *)sqlite3_column_text(stmt, 1);
-                // see https://www.sqlite.org/datatype3.html (Determination Of Column Affinity)
-                if (decl_type && strcasestr(decl_type, "INT")) {
-                    prikey = sqlite_strdup((const char *)sqlite3_column_text(stmt, 2));
-                }
+            const char *name = (const char *)sqlite3_column_text(stmt, 0);
+            const char *decl_type = (const char *)sqlite3_column_text(stmt, 1);
+            // see https://www.sqlite.org/datatype3.html (Determination Of Column Affinity)
+            if (name && decl_type && strcasestr(decl_type, "INT")) prikey = sqlite_strdup(name);
+
+            // a composite primary key gives more than one row and cannot stand in for the
+            // rowid (step() invalidates name, so the copy has to be taken first)
+            if (prikey && sqlite3_step(stmt) != SQLITE_DONE) {
+                sqlite3_free(prikey);
+                prikey = NULL;
             }
         }
     }
@@ -548,36 +605,23 @@ static inline int8_t q_round_s8 (float s) {
     return (int8_t)(int)r;
 }
 
+// NOTE: these go through q_round_u8/q_round_s8 rather than casting first and clamping
+// after. Converting a float to int is undefined when the value is NaN or outside the
+// int range, and it does differ in practice: arm64 saturates, x86 yields INT_MIN. The
+// helpers clamp in float and only then cast, which is also what every other quantizer
+// below already did.
 static inline void quantize_float32_to_unsigned8bit (const float *v, uint8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
-        float s0 = (v[i]     - offset) * scale;
-        float s1 = (v[i + 1] - offset) * scale;
-        float s2 = (v[i + 2] - offset) * scale;
-        float s3 = (v[i + 3] - offset) * scale;
-
-        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
-        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
-        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
-        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
-
-        r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
-        r1 = r1 > 255 ? 255 : (r1 < 0 ? 0 : r1);
-        r2 = r2 > 255 ? 255 : (r2 < 0 ? 0 : r2);
-        r3 = r3 > 255 ? 255 : (r3 < 0 ? 0 : r3);
-
-        q[i]     = (uint8_t)r0;
-        q[i + 1] = (uint8_t)r1;
-        q[i + 2] = (uint8_t)r2;
-        q[i + 3] = (uint8_t)r3;
+        q[i]     = q_round_u8((v[i]     - offset) * scale);
+        q[i + 1] = q_round_u8((v[i + 1] - offset) * scale);
+        q[i + 2] = q_round_u8((v[i + 2] - offset) * scale);
+        q[i + 3] = q_round_u8((v[i + 3] - offset) * scale);
     }
 
     // Handle remaining elements
     for (; i < n; ++i) {
-        float scaled = (v[i] - offset) * scale;
-        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
-        rounded = rounded > 255 ? 255 : (rounded < 0 ? 0 : rounded);
-        q[i] = (uint8_t)rounded;
+        q[i] = q_round_u8((v[i] - offset) * scale);
     }
 }
 
@@ -660,32 +704,14 @@ static inline void quantize_i8_to_unsigned8bit (const int8_t *v, uint8_t *q, flo
 static inline void quantize_float32_to_signed8bit (const float *v, int8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
-        float s0 = (v[i]     - offset) * scale;
-        float s1 = (v[i + 1] - offset) * scale;
-        float s2 = (v[i + 2] - offset) * scale;
-        float s3 = (v[i + 3] - offset) * scale;
-
-        int r0 = (int)(s0 + 0.5f * (1.0f - 2.0f * (s0 < 0.0f)));
-        int r1 = (int)(s1 + 0.5f * (1.0f - 2.0f * (s1 < 0.0f)));
-        int r2 = (int)(s2 + 0.5f * (1.0f - 2.0f * (s2 < 0.0f)));
-        int r3 = (int)(s3 + 0.5f * (1.0f - 2.0f * (s3 < 0.0f)));
-
-        r0 = r0 > 127 ? 127 : (r0 < -128 ? -128 : r0);
-        r1 = r1 > 127 ? 127 : (r1 < -128 ? -128 : r1);
-        r2 = r2 > 127 ? 127 : (r2 < -128 ? -128 : r2);
-        r3 = r3 > 127 ? 127 : (r3 < -128 ? -128 : r3);
-
-        q[i]     = (int8_t)r0;
-        q[i + 1] = (int8_t)r1;
-        q[i + 2] = (int8_t)r2;
-        q[i + 3] = (int8_t)r3;
+        q[i]     = q_round_s8((v[i]     - offset) * scale);
+        q[i + 1] = q_round_s8((v[i + 1] - offset) * scale);
+        q[i + 2] = q_round_s8((v[i + 2] - offset) * scale);
+        q[i + 3] = q_round_s8((v[i + 3] - offset) * scale);
     }
 
     for (; i < n; ++i) {
-        float scaled = (v[i] - offset) * scale;
-        int rounded = (int)(scaled + 0.5f * (1.0f - 2.0f * (scaled < 0.0f)));
-        rounded = rounded > 127 ? 127 : (rounded < -128 ? -128 : rounded);
-        q[i] = (int8_t)rounded;
+        q[i] = q_round_s8((v[i] - offset) * scale);
     }
 }
 
@@ -1434,6 +1460,46 @@ const char *vector_distance_to_name (vector_distance type) {
     return "N/A";
 }
 
+// HAMMING is implemented for BIT vectors only, every other type implements
+// everything but HAMMING. BIT columns are always scanned with HAMMING (the scan
+// forces it), so any distance is accepted for them.
+static bool vector_distance_is_supported (vector_distance distance, vector_type type) {
+    if (type == VECTOR_TYPE_BIT) return true;
+    return (distance != VECTOR_DISTANCE_HAMMING);
+}
+
+// bounds-checked lookup: returns NULL instead of an out-of-range or unpopulated
+// entry, so a gap in the dispatch table becomes an error and not a crash
+static distance_function_t vector_lookup_distance_function (vector_distance distance, vector_type type) {
+    if ((int)distance <= 0 || (int)distance >= VECTOR_DISTANCE_MAX) return NULL;
+    if ((int)type <= 0 || (int)type >= VECTOR_TYPE_MAX) return NULL;
+    return dispatch_distance_table[distance][type];
+}
+
+// For unit-length vectors cosine distance is exactly 1 - dot, so the two norm
+// accumulators - two thirds of the arithmetic in the cosine kernels - drop out of the
+// inner loop. The DOT kernels return the negated dot product, hence the addition.
+static float cosine_normalized_f32 (const void *v1, const void *v2, int n) {
+    distance_function_t dot_fn = dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_F32];
+    float d = 1.0f + dot_fn(v1, v2, n);
+    if (d < 0.0f) return 0.0f;
+    if (d > 2.0f) return 2.0f;
+    return d;
+}
+
+// The stored vectors are unit length only because the caller said so with normalized=1,
+// and only in full precision: the quantized index holds scaled integers whose norm is
+// whatever the scale made it, so the shortcut is not valid there. The query is normalized
+// once per scan in vCursorFilterCommon, which makes the result exact rather than merely
+// rank-equivalent.
+static bool vector_use_normalized_cosine (const table_context *t_ctx, bool quantized) {
+    if (quantized) return false;
+    if (!t_ctx->options.v_normalized) return false;
+    if (t_ctx->options.v_distance != VECTOR_DISTANCE_COSINE) return false;
+    if (t_ctx->options.v_type != VECTOR_TYPE_F32) return false;
+    return (dispatch_distance_table[VECTOR_DISTANCE_DOT][VECTOR_TYPE_F32] != NULL);
+}
+
 #if DEBUG_VECTOR_SERIALIZATION
 static void vector_print (void *buf, vector_type type, int n) {
     printf("type: %s - dim: %d [", vector_type_to_name(type), n);
@@ -1643,31 +1709,32 @@ static inline size_t quantized_row_bytes (vector_qtype qtype, int dim, int bits)
 // MARK: - SQL -
 
 static char *generate_create_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "CREATE TABLE IF NOT EXISTS vector0_%q_%q (rowid1 INTEGER, rowid2 INTEGER, counter INTEGER, data BLOB);", table_name, column_name);
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "CREATE TABLE IF NOT EXISTS \"vector0_%w_%w\" (rowid1 INTEGER, rowid2 INTEGER, counter INTEGER, data BLOB);", table_name, column_name);
 }
 
 static char *generate_drop_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "DROP TABLE IF EXISTS vector0_%q_%q;", table_name, column_name);
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "DROP TABLE IF EXISTS \"vector0_%w_%w\";", table_name, column_name);
 }
 
 static char *generate_select_from_table (const char *table_name, const char *column_name, const char *pk_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT %q, %q FROM %q ORDER BY %q;", pk_name, column_name, table_name, pk_name);
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT \"%w\", \"%w\" FROM \"%w\" ORDER BY \"%w\";", pk_name, column_name, table_name, pk_name);
 }
 
 static char *generate_select_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT counter, data FROM vector0_%q_%q;", table_name, column_name);
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT counter, data FROM \"vector0_%w_%w\";", table_name, column_name);
 }
 
 static char *generate_memory_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT SUM(LENGTH(data)) FROM vector0_%q_%q;", table_name, column_name);
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT SUM(LENGTH(data)) FROM \"vector0_%w_%w\";", table_name, column_name);
 }
 
 static char *generate_insert_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "INSERT INTO vector0_%q_%q (rowid1, rowid2, counter, data) VALUES (?, ?, ?, ?);", table_name, column_name);
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "INSERT INTO \"vector0_%w_%w\" (rowid1, rowid2, counter, data) VALUES (?, ?, ?, ?);", table_name, column_name);
 }
 
 static char *generate_quant_table_name (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
-    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "vector0_%q_%q", table_name, column_name);
+    // NOTE: a plain name, not SQL - it is bound as a parameter, so no escaping here
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "vector0_%s_%s", table_name, column_name);
 }
 
 // MARK: - Vector Context and Options -
@@ -1687,7 +1754,7 @@ void vector_context_free (void *p) {
             if (ctx->tables[i].t_name) sqlite3_free(ctx->tables[i].t_name);
             if (ctx->tables[i].c_name) sqlite3_free(ctx->tables[i].c_name);
             if (ctx->tables[i].pk_name) sqlite3_free(ctx->tables[i].pk_name);
-            if (ctx->tables[i].preloaded) sqlite3_free(ctx->tables[i].preloaded);
+            preload_index_release(ctx->tables[i].preloaded);
             table_context_free_turbo_cache(&ctx->tables[i]);
         }
         sqlite3_free(p);
@@ -1828,6 +1895,19 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     }
     if (qtype != VECTOR_QUANT_TURBO) table_context_free_turbo_cache(t_ctx);
 
+    // A BIT column is already binary, so 8-bit quantization has nothing to scale: it wrote
+    // (dim+7)/8 bytes into a dim-byte slot and left the rest uninitialised. AUTO now means
+    // the identity 1BIT, and an explicit 8-bit request is refused. This used to fail with
+    // an unrelated message on a populated table and to silently record qtype=UINT8 on an
+    // empty one, which then applied to rows inserted later.
+    if (type == VECTOR_TYPE_BIT) {
+        if (qtype == VECTOR_QUANT_AUTO) qtype = VECTOR_QUANT_1BIT;
+        if (qtype != VECTOR_QUANT_1BIT) {
+            context_result_error(context, SQLITE_ERROR, "BIT vectors can only be quantized with qtype=1BIT");
+            return SQLITE_MISUSE;
+        }
+    }
+
     // compute size of a single quant, format is: rowid + quantized payload
     size_t q_size = quantized_row_bytes(qtype, dim, q_bits);
     if (q_size == 0) {
@@ -1837,7 +1917,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     
     // max_memory == 0 means use all required memory
     if (max_memory == 0) {
-        sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*) FROM %q;", table_name);
+        sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*) FROM \"%w\";", table_name);
         int64_t count = sqlite_read_int64(db, sql);
         max_memory = (count == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)count * (uint64_t)q_size;
         if (count <= 0) {
@@ -2027,7 +2107,10 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
                 case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)blob, data, offset, scale, dim, qtype); break;
                 case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)blob, data, offset, scale, dim, qtype); break;
                 case VECTOR_TYPE_I8: quantize_i8((const int8_t *)blob, data, offset, scale, dim, qtype); break;
-                case VECTOR_TYPE_BIT: memcpy(data, blob, (dim + 7) / 8); break; // BIT to 8-bit: just copy
+                // unreachable for new indexes (see the guard above), but one written by an
+                // older build can still be loaded: zero the slot so the bytes past the
+                // packed bits are never fed to a distance kernel uninitialised
+                case VECTOR_TYPE_BIT: memset(data, 0, (size_t)dim); memcpy(data, blob, (dim + 7) / 8); break;
             }
         }
         
@@ -2079,15 +2162,8 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
         return;
     }
     
-    // free previous preload (if any)
-    sqlite3_mutex_enter(qmutex);
-    if (t_ctx->preloaded) {
-        sqlite3_free(t_ctx->preloaded);
-        t_ctx->preloaded = NULL;
-        t_ctx->precounter = 0;
-        t_ctx->preloaded_bytes = 0;
-    }
-    sqlite3_mutex_leave(qmutex);
+    // drop the previous preload: scans already walking it keep their own reference
+    preload_index_install(t_ctx, NULL);
 
     if (t_ctx->options.q_type == VECTOR_QUANT_TURBO) {
         int rc = table_context_ensure_turbo_codebook(t_ctx, t_ctx->options.q_bits, t_ctx->options.v_dim);
@@ -2102,17 +2178,17 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
     generate_memory_quant_table(table_name, column_name, sql);
     sqlite3 *db = sqlite3_context_db_handle(context);
     sqlite3_int64 required = sqlite_read_int64(db, sql);
-    if (required == 0) {
+    if (required <= 0) {
         context_result_error(context, SQLITE_ERROR, "Unable to read data from database. Ensure that vector_quantize() has been called before using vector_quantize_preload()");
         return;
     }
     
-    int counter = 0;
-    void *buffer = (void *)sqlite3_malloc64(required);
-    if (!buffer) {
+    preload_index *idx = preload_index_new(required);
+    if (!idx) {
         context_result_error(context, SQLITE_NOMEM, "Out of memory: unable to allocate %lld bytes for quant buffer", (long long)required);
         return;
     }
+    uint8_t *buffer = idx->data;
     
     sqlite3_stmt *vm = NULL;
     generate_select_quant_table(table_name, column_name, sql);
@@ -2120,11 +2196,15 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
     if (rc != SQLITE_OK) {
         context_result_error(context, rc, "Internal statement error: %s", sqlite3_errmsg(db));
         sqlite3_finalize(vm);
-        sqlite3_free(buffer);
+        preload_index_release(idx);
         return;
     }
     
-    int seek = 0;
+    // the shadow table is an ordinary writable table and can change between the SUM that
+    // sized the buffer and the scan below, so bound every copy against what was allocated
+    const size_t row_stride = quantized_row_bytes(t_ctx->options.q_type, t_ctx->options.v_dim, t_ctx->options.q_bits);
+    sqlite3_int64 seek = 0;
+    sqlite3_int64 counter = 0;
     while (1) {
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;} // return error: rebuild must be call (only if first time run)
@@ -2132,26 +2212,38 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
         
         int n = sqlite3_column_int(vm, 0);
         int bytes = sqlite3_column_bytes(vm, 1);
-        uint8_t *data = (uint8_t *)sqlite3_column_blob(vm, 1);
+        const uint8_t *data = (const uint8_t *)sqlite3_column_blob(vm, 1);
         
-        // no check here because I am sure quantization was performed only on non NULL data
-        memcpy((uint8_t *)buffer + seek, data, bytes);
+        if (!data || n < 0 || bytes < 0 || (sqlite3_int64)bytes > required - seek) {
+            rc = SQLITE_CORRUPT;
+            break;
+        }
+        
+        memcpy(buffer + seek, data, (size_t)bytes);
         seek += bytes;
         counter += n;
     }
     sqlite3_finalize(vm);
     
+    // the loaded rows must really hold the number of vectors they claim: this is the same
+    // invariant the scans verify per chunk, checked once here so a malformed index is
+    // rejected at preload time instead of at query time
+    if ((rc == SQLITE_OK) && ((counter > INT_MAX) || ((sqlite3_uint64)seek < (sqlite3_uint64)counter * (sqlite3_uint64)row_stride))) {
+        rc = SQLITE_CORRUPT;
+    }
+    
     if (rc != SQLITE_OK) {
-        sqlite3_free(buffer);
-        context_result_error(context, rc, "vector_quantize_preload failed: %s", sqlite3_errmsg(db));
+        preload_index_release(idx);
+        if (rc == SQLITE_CORRUPT) context_result_error(context, rc, "vector_quantize_preload failed: inconsistent quantization data for '%s.%s'", table_name, column_name);
+        else context_result_error(context, rc, "vector_quantize_preload failed: %s", sqlite3_errmsg(db));
         return;
     }
     
-    sqlite3_mutex_enter(qmutex);
-    t_ctx->preloaded = buffer;
-    t_ctx->precounter = counter;
-    t_ctx->preloaded_bytes = required;
-    sqlite3_mutex_leave(qmutex);
+    idx->counter = (int)counter;
+    // seek, not required: rows removed between the two queries leave the tail of the
+    // buffer uninitialised, and the scans bound themselves with this length
+    idx->bytes = seek;
+    preload_index_install(t_ctx, idx);
 }
 
 static int vector_quantize (sqlite3_context *context, const char *table_name, const char *column_name, const char *arg_options, bool *was_preloaded) {
@@ -2204,17 +2296,27 @@ static int vector_quantize (sqlite3_context *context, const char *table_name, co
     
     // success: returns the total number of quantized rows
     sqlite3_result_int64(context, (sqlite3_int64)counter);
-    if (was_preloaded) *was_preloaded = (t_ctx->preloaded != NULL);
+    if (was_preloaded) {
+        sqlite3_mutex_enter(qmutex);
+        *was_preloaded = (t_ctx->preloaded != NULL);
+        sqlite3_mutex_leave(qmutex);
+    }
     return SQLITE_OK;
     
 quantize_cleanup: {
-        const char *errmsg = sqlite3_errmsg(db);
+        // capture before the rollback, which resets the connection's error state
+        char *errmsg = (sqlite3_errcode(db) != SQLITE_OK) ? sqlite3_mprintf("%s", sqlite3_errmsg(db)) : NULL;
         if (savepoint_open) {
             sqlite3_exec(db, "ROLLBACK TO quantize;", NULL, NULL, NULL);
             sqlite3_exec(db, "RELEASE quantize;", NULL, NULL, NULL);
         }
         
-        sqlite3_result_error(context, errmsg, -1);
+        // only replace the message when SQLite actually has one: the callees set their own
+        // through context_result_error, and overwriting it reported "not an error"
+        if (errmsg) {
+            sqlite3_result_error(context, errmsg, -1);
+            sqlite3_free(errmsg);
+        }
         sqlite3_result_error_code(context, rc);
         return rc;
     }
@@ -2271,15 +2373,9 @@ static void vector_quantize_cleanup (sqlite3_context *context, int argc, sqlite3
     table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
     if (!t_ctx) return; // if no table context exists then do nothing
 
-    // release any memory used in quantization
-    sqlite3_mutex_enter(qmutex);
-    if (t_ctx->preloaded) {
-        sqlite3_free(t_ctx->preloaded);
-        t_ctx->preloaded = NULL;
-        t_ctx->precounter = 0;
-        t_ctx->preloaded_bytes = 0;
-    }
-    sqlite3_mutex_leave(qmutex);
+    // release any memory used in quantization: scans still walking the index keep it
+    // alive through their own reference and free it when they are done
+    preload_index_install(t_ctx, NULL);
 
     // drop quant table (if any)
     char sql[STATIC_SQL_SIZE];
@@ -2541,6 +2637,10 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         sqlite3_free(c->stream.turbo_norm_lut);
         c->stream.turbo_norm_lut = NULL;
     }
+    if (c->stream.preload_ref) {
+        preload_index_release(c->stream.preload_ref);
+        c->stream.preload_ref = NULL;
+    }
     memset(&c->stream, 0, sizeof(c->stream));
 
     if (argc != 3 && argc != 4) {
@@ -2592,6 +2692,13 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
         if (!vector) return sqlite_vtab_set_error(&vtab->base, "%s: input vector cannot be NULL", fname);
+        
+        // the JSON branch above validates the dimension inside vector_from_json, the BLOB
+        // branch must do it here: the distance functions read v_dim elements unconditionally
+        size_t expected_bytes = vector_bytes_for_dim(t_ctx->options.v_type, t_ctx->options.v_dim);
+        if ((size_t)vsize != expected_bytes) {
+            return sqlite_vtab_set_error(&vtab->base, "%s: input vector must be %lld bytes (%d dimensions of type %s), but %d were provided", fname, (long long)expected_bytes, t_ctx->options.v_dim, vector_type_to_name(t_ctx->options.v_type), vsize);
+        }
     }
     VECTOR_PRINT((void*)vector, t_ctx->options.v_type, t_ctx->options.v_dim);
     
@@ -2605,6 +2712,26 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         }
     }
 
+    // with the 1 - dot shortcut the query has to be unit length too, and normalizing it
+    // once per scan costs one pass over a single vector
+    if (vector_use_normalized_cosine(t_ctx, quantized)) {
+        int dim = t_ctx->options.v_dim;
+        float *qn = (float *)sqlite_memdup(vector, vsize);
+        if (!qn) {
+            if (vector_allocated) sqlite3_free((void *)vector);
+            return SQLITE_NOMEM;
+        }
+        double norm_sq = 0.0;
+        for (int i = 0; i < dim; ++i) norm_sq += (double)qn[i] * (double)qn[i];
+        if (norm_sq > 0.0) {
+            float inv = (float)(1.0 / sqrt(norm_sq));
+            for (int i = 0; i < dim; ++i) qn[i] *= inv;
+        }
+        if (vector_allocated) sqlite3_free((void *)vector);
+        vector = qn;
+        vector_allocated = true;
+    }
+
     c->table = t_ctx;
     if (is_streaming) {
         int rc = stream_callback(vtab->db, c, vector, vsize);
@@ -2615,9 +2742,14 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
 
     // non-streaming flow
     int k = sqlite3_value_int(argv[3]);
-    if (k == 0) {
+    if (k <= 0) {
+        // an empty result, not an error: any non-OK return from xFilter is an error code
+        // to SQLite, and SQLITE_DONE only looked harmless because it happens to be the
+        // value sqlite3_step() reports at end of results
         if (vector_allocated) sqlite3_free((void *)vector);
-        return SQLITE_DONE;
+        c->row_index = 0;
+        c->row_count = 0;
+        return SQLITE_OK;
     }
 
     if (c->row_count != k) {
@@ -2718,8 +2850,13 @@ static int vFullScanBestIndex (sqlite3_vtab *tab, sqlite3_index_info *pIdxInfo) 
         // top-k mode: 4 positional args, argv[3] has the k integer
         pIdxInfo->estimatedCost = (double)1;
         pIdxInfo->estimatedRows = 100;
-        pIdxInfo->orderByConsumed = 1;
         pIdxInfo->idxNum = 1;
+        
+        // rows are emitted in ascending distance order, so that is the only ORDER BY we
+        // may claim: telling SQLite otherwise makes it drop a sorter we do not replace
+        pIdxInfo->orderByConsumed = (pIdxInfo->nOrderBy == 1 &&
+                                     pIdxInfo->aOrderBy[0].iColumn == VECTOR_COLUMN_DISTANCE &&
+                                     pIdxInfo->aOrderBy[0].desc == 0);
     } else {
         // streaming mode: 3 positional args, no sorting guaranteed
         pIdxInfo->estimatedCost = 1e8;
@@ -2747,6 +2884,7 @@ static int vFullScanCursorClose (sqlite3_vtab_cursor *cur){
     if (c->stream.turbo_query_lut) sqlite3_free(c->stream.turbo_query_lut);
     if (c->stream.turbo_norm_lut) sqlite3_free(c->stream.turbo_norm_lut);
     if (c->stream.vm) sqlite3_finalize(c->stream.vm);
+    preload_index_release(c->stream.preload_ref);
     sqlite3_free(c);
     return SQLITE_OK;
 }
@@ -2893,6 +3031,9 @@ static int vFullScanCursorNext (sqlite3_vtab_cursor *cur){
             c->stream.is_eof = 1;
             return SQLITE_OK;
         }
+        if (c->stream.data_bytes < 0 || (sqlite3_uint64)c->stream.data_bytes < ((sqlite3_uint64)c->stream.dindex + 1u) * (sqlite3_uint64)total_stride) {
+            return SQLITE_CORRUPT;
+        }
 
         const uint8_t *data = (const uint8_t *)c->stream.data;
         size_t i = (size_t)c->stream.dindex;
@@ -2919,7 +3060,12 @@ static int vFullScanCursorNext (sqlite3_vtab_cursor *cur){
 
         c->stream.dcounter = sqlite3_column_int(vm, 0);
         c->stream.data     = (uint8_t *)sqlite3_column_blob(vm, 1);
+        c->stream.data_bytes = sqlite3_column_bytes(vm, 1);
         c->stream.dindex   = 0; // reset index for the new chunk
+        if (c->stream.data == NULL || c->stream.dcounter < 0 || c->stream.data_bytes < 0 ||
+            (sqlite3_uint64)c->stream.data_bytes < (sqlite3_uint64)c->stream.dcounter * (sqlite3_uint64)total_stride) {
+            return SQLITE_CORRUPT;
+        }
     }
 
     const uint8_t *data = (const uint8_t *)c->stream.data;
@@ -2939,6 +3085,7 @@ static int vFullScanCursorNext (sqlite3_vtab_cursor *cur){
         // finished current chunk; force reload on next call
         c->stream.dcounter = 0;
         c->stream.data = NULL; // clear stale pointer to blob memory
+        c->stream.data_bytes = 0;
     }
 
     return SQLITE_OK;
@@ -3021,7 +3168,7 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
     const char *table_name = c->table->t_name;
     int dimension = c->table->options.v_dim;
     
-    char *sql = sqlite3_mprintf("SELECT %q, %q FROM %q;", pk_name, col_name, table_name);
+    char *sql = sqlite3_mprintf("SELECT \"%w\", \"%w\" FROM \"%w\";", pk_name, col_name, table_name);
     if (!sql) return SQLITE_NOMEM;
     
     sqlite3_stmt *vm = NULL;
@@ -3032,7 +3179,12 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
     vector_distance vd = c->table->options.v_distance;
     vector_type vt = c->table->options.v_type;
     if (vt == VECTOR_TYPE_BIT) vd = VECTOR_DISTANCE_HAMMING;  // Force Hamming for BIT type
-    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    distance_function_t distance_fn = vector_lookup_distance_function(vd, vt);
+    if (!distance_fn) {
+        rc = sqlite_vtab_set_error(c->base.pVtab, "Distance '%s' is not supported for vector type '%s'", vector_distance_to_name(vd), vector_type_to_name(vt));
+        goto cleanup;
+    }
+    if (vector_use_normalized_cosine(c->table, false)) distance_fn = cosine_normalized_f32;
     int dist_size = (vt == VECTOR_TYPE_BIT) ? ((dimension + 7) / 8) : dimension;
 
     size_t expected_bytes = vector_bytes_for_dim(vt, dimension);
@@ -3070,12 +3222,20 @@ static int vFullScanCursorFilter (sqlite3_vtab_cursor *cur, int idxNum, const ch
 
 // MARK: -
 
-static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, vector_qtype qtype, int dim) {
-    const int counter = c->table->precounter;
-    const uint8_t *data = c->table->preloaded;
+static int vQuantRunMemory(vFullScanCursor *c, const preload_index *idx, uint8_t *v, vector_qtype qtype, int dim) {
+    const int counter = idx->counter;
+    const uint8_t *data = idx->data;
     const size_t rowid_size = sizeof(int64_t);
     const size_t vector_size = (qtype == VECTOR_QUANT_1BIT) ? ((dim + 7) / 8) : (dim * sizeof(uint8_t));
     const size_t total_stride = rowid_size + vector_size;
+
+    // the preloaded index is built from an ordinary writable table, so never trust its
+    // row count against its length (the TurboQuant paths already do this)
+    const sqlite3_int64 data_bytes = idx->bytes;
+    if (!data || counter < 0 || data_bytes < 0 || (sqlite3_uint64)data_bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
+        sqlite_vtab_set_error(c->base.pVtab, "Corrupted quantization data preloaded for '%s.%s'", c->table->t_name, c->table->c_name);
+        return SQLITE_CORRUPT;
+    }
 
     double *distance = c->distance;
     int64_t *rowids = (int64_t *)c->rowids;
@@ -3089,7 +3249,8 @@ static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, vector_qtype qtype, i
         vt = VECTOR_TYPE_BIT;
         vd = VECTOR_DISTANCE_HAMMING;
     }
-    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    distance_function_t distance_fn = vector_lookup_distance_function(vd, vt);
+    if (!distance_fn) return sqlite_vtab_set_error(c->base.pVtab, "Distance '%s' is not supported for vector type '%s'", vector_distance_to_name(vd), vector_type_to_name(vt));
 
     for (int i = 0; i < counter; ++i) {
         const uint8_t *current_data = data + (i * total_stride);
@@ -3220,8 +3381,10 @@ static int vTurboRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         if (norm_rows != lut_rows) { rc = SQLITE_CORRUPT; goto cleanup; }
     }
 
-    if (c->table->preloaded) {
-        rc = vTurboRunPackedRows(c, (const uint8_t *)c->table->preloaded, c->table->preloaded_bytes, c->table->precounter, qrot, qnorm_sq, c->table->turbo_centroids, query_lut, norm_lut, lut_rows, bits);
+    preload_index *idx = preload_index_acquire(c->table);
+    if (idx) {
+        rc = vTurboRunPackedRows(c, idx->data, idx->bytes, idx->counter, qrot, qnorm_sq, c->table->turbo_centroids, query_lut, norm_lut, lut_rows, bits);
+        preload_index_release(idx);
         goto cleanup;
     }
 
@@ -3286,13 +3449,15 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
             case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_I8: quantize_i8((const int8_t *)v1, v, offset, scale, dimension, qtype); break;
-            case VECTOR_TYPE_BIT: memcpy(v, v1, (dimension + 7) / 8); break; // BIT to 8-bit: just copy
+            case VECTOR_TYPE_BIT: memset(v, 0, (size_t)dimension); memcpy(v, v1, (dimension + 7) / 8); break; // see vector_rebuild_quantization
         }
     }
 
-    if (c->table->preloaded) {
-        int rc = vQuantRunMemory(c, v, qtype, dimension);
-        if (v) sqlite3_free(v);
+    preload_index *idx = preload_index_acquire(c->table);
+    if (idx) {
+        int rc = vQuantRunMemory(c, idx, v, qtype, dimension);
+        preload_index_release(idx);
+        sqlite3_free(v);
         return rc;
     }
     #if DEBUG_VECTOR_SERIALIZATION
@@ -3319,7 +3484,13 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         vt = VECTOR_TYPE_BIT;
         vd = VECTOR_DISTANCE_HAMMING;
     }
-    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    distance_function_t distance_fn = vector_lookup_distance_function(vd, vt);
+    if (!distance_fn) {
+        sqlite_vtab_set_error(c->base.pVtab, "Distance '%s' is not supported for vector type '%s'", vector_distance_to_name(vd), vector_type_to_name(vt));
+        sqlite3_finalize(vm);
+        sqlite3_free(v);
+        return SQLITE_ERROR;
+    }
     
     while (1) {
         rc = sqlite3_step(vm);
@@ -3328,6 +3499,13 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         
         int counter = sqlite3_column_int(vm, 0);
         uint8_t *data = (uint8_t *)sqlite3_column_blob(vm, 1);
+        int bytes = sqlite3_column_bytes(vm, 1);
+        if (!data || counter < 0 || bytes < 0 || (sqlite3_uint64)bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
+            sqlite_vtab_set_error(c->base.pVtab, "Corrupted quantization data for '%s.%s'", c->table->t_name, c->table->c_name);
+            sqlite3_finalize(vm);
+            sqlite3_free(v);
+            return SQLITE_CORRUPT;
+        }
         
         // cache the maximum value to avoid repeated memory accesses
         double current_max_distance = c->distance[c->max_index];
@@ -3376,7 +3554,7 @@ static int vStreamScanCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1
     c->stream.vsize = v1size;
     c->stream.vdim = dimension;
     
-    char *sql = sqlite3_mprintf("SELECT %q, %q FROM %q;", pk_name, col_name, table_name);
+    char *sql = sqlite3_mprintf("SELECT \"%w\", \"%w\" FROM \"%w\";", pk_name, col_name, table_name);
     if (!sql) {
         sqlite3_free(v);
         c->stream.vector = NULL;
@@ -3391,7 +3569,12 @@ static int vStreamScanCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1
     vector_distance vd = c->table->options.v_distance;
     vector_type vt = c->table->options.v_type;
     if (vt == VECTOR_TYPE_BIT) vd = VECTOR_DISTANCE_HAMMING;  // Force Hamming for BIT type
-    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    distance_function_t distance_fn = vector_lookup_distance_function(vd, vt);
+    if (!distance_fn) {
+        rc = sqlite_vtab_set_error(c->base.pVtab, "Distance '%s' is not supported for vector type '%s'", vector_distance_to_name(vd), vector_type_to_name(vt));
+        goto cleanup;
+    }
+    if (vector_use_normalized_cosine(c->table, false)) distance_fn = cosine_normalized_f32;
 
     c->stream.distance_fn = distance_fn;
     c->stream.vm = vm;
@@ -3456,11 +3639,13 @@ static int vStreamTurboCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v
         }
     }
 
-    if (c->table->preloaded) {
+    preload_index *idx = preload_index_acquire(c->table);
+    if (idx) {
+        c->stream.preload_ref = idx;
         c->stream.dindex = 0;
-        c->stream.data = c->table->preloaded;
-        c->stream.dcounter = c->table->precounter;
-        c->stream.data_bytes = c->table->preloaded_bytes;
+        c->stream.data = idx->data;
+        c->stream.dcounter = idx->counter;
+        c->stream.data_bytes = idx->bytes;
         return SQLITE_OK;
     }
 
@@ -3521,7 +3706,7 @@ static int vStreamQuantCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v
             case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)v1, v, offset, scale, dimension, qtype); break;
             case VECTOR_TYPE_I8: quantize_i8((const int8_t *)v1, v, offset, scale, dimension, qtype); break;
-            case VECTOR_TYPE_BIT: memcpy(v, v1, (dimension + 7) / 8); break; // BIT to 8-bit: just copy
+            case VECTOR_TYPE_BIT: memset(v, 0, (size_t)dimension); memcpy(v, v1, (dimension + 7) / 8); break; // see vector_rebuild_quantization
         }
     }
 
@@ -3537,14 +3722,22 @@ static int vStreamQuantCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v
         vt = VECTOR_TYPE_BIT;
         vd = VECTOR_DISTANCE_HAMMING;
     }
-    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    distance_function_t distance_fn = vector_lookup_distance_function(vd, vt);
+    if (!distance_fn) {
+        sqlite3_free(v);
+        c->stream.vector = NULL;
+        return sqlite_vtab_set_error(c->base.pVtab, "Distance '%s' is not supported for vector type '%s'", vector_distance_to_name(vd), vector_type_to_name(vt));
+    }
     c->stream.distance_fn = distance_fn;
     
     // check if quant representation was preloaded
-    if (c->table->preloaded) {
+    preload_index *idx = preload_index_acquire(c->table);
+    if (idx) {
+        c->stream.preload_ref = idx;
         c->stream.dindex = 0;
-        c->stream.data = c->table->preloaded;
-        c->stream.dcounter = c->table->precounter;
+        c->stream.data = idx->data;
+        c->stream.dcounter = idx->counter;
+        c->stream.data_bytes = idx->bytes;
         return SQLITE_OK;
     }
     
@@ -3648,6 +3841,11 @@ static void vector_init (sqlite3_context *context, int argc, sqlite3_value **arg
     
     if (options.v_dim == 0) {
         context_result_error(context, SQLITE_ERROR, "Vector dimension value is mandatory in vector_init");
+        return;
+    }
+    
+    if (vector_distance_is_supported(options.v_distance, options.v_type) == false) {
+        context_result_error(context, SQLITE_ERROR, "Distance '%s' is not supported for vector type '%s'", vector_distance_to_name(options.v_distance), vector_type_to_name(options.v_type));
         return;
     }
     
@@ -3798,6 +3996,8 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     return SQLITE_OK;
 
 cleanup:
-    vector_context_free(ctx);
+    // do NOT free ctx here: it is owned by the destructor registered with
+    // sqlite3_create_function_v2() above, which SQLite invokes both when that call itself
+    // fails and when the connection is closed. Freeing it again would be a double free.
     return rc;
 }
