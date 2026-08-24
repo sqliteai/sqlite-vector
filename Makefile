@@ -151,6 +151,36 @@ unittest:
 	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $(TEST_SRC) -o $(BUILD_DIR)/test_vector -lm -lpthread
 	./$(BUILD_DIR)/test_vector
 
+# The unittest target above builds every source in a single invocation, which leaves
+# __AVX2__ and __AVX512F__ undefined: those kernels compile to nothing and the suite
+# silently exercises the scalar fallback instead. This target compiles per translation
+# unit the way the extension does, so the SIMD backends are actually under test.
+#
+#   make unittest-simd                                    run on whatever this CPU supports
+#   make unittest-simd EXPECT_BACKEND=AVX512              fail unless AVX-512 was installed
+#   make unittest-simd RUNNER="sde64 -spr --"             run under an emulator
+UNITTEST_OBJ = $(patsubst %.c, $(BUILD_DIR)/ut-%.o, $(notdir $(SRC_FILES))) $(BUILD_DIR)/ut-sqlite3.o
+
+$(BUILD_DIR)/ut-distance-avx2.o: ISA_CFLAGS := $(AVX2_CFLAGS)
+$(BUILD_DIR)/ut-distance-avx512.o: ISA_CFLAGS := $(AVX512_CFLAGS)
+
+$(BUILD_DIR)/ut-%.o: %.c
+	$(CC) $(CFLAGS) $(ISA_CFLAGS) -DSQLITE_CORE -O2 -c $< -o $@
+
+$(BUILD_DIR)/backend: test/backend.c $(UNITTEST_OBJ)
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $< $(UNITTEST_OBJ) -o $@ -lm -lpthread
+
+$(BUILD_DIR)/test_vector_simd: test/test_vector.c $(UNITTEST_OBJ)
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $< $(UNITTEST_OBJ) -o $@ -lm -lpthread
+
+# RUNNER wraps both binaries, so an emulator sees the same build the assertion checked
+RUNNER ?=
+EXPECT_BACKEND ?=
+
+unittest-simd: $(BUILD_DIR)/backend $(BUILD_DIR)/test_vector_simd
+	$(RUNNER) ./$(BUILD_DIR)/backend $(EXPECT_BACKEND)
+	$(RUNNER) ./$(BUILD_DIR)/test_vector_simd
+
 # Clean up generated files
 clean:
 	rm -rf $(BUILD_DIR)/* $(DIST_DIR)/* *.gcda *.gcno *.gcov *.sqlite
