@@ -643,69 +643,78 @@ float bfloat16_distance_cosine_avx2 (const void *v1, const void *v2, int n) {
 
 // MARK: - UINT8 -
 
+// The integer kernels used to widen every byte to 32 bits before multiplying, on a single
+// accumulator chain. x86 has instructions for exactly this shape: PSADBW sums absolute
+// differences of 32 bytes in one go (L1), and PMADDWD multiplies 16-bit pairs and adds
+// adjacent products into 32-bit lanes, which is a squared difference or a dot product
+// depending on what you feed it. Two byte-sized factors always fit 16 bits, and PMADDWD's
+// pairwise add keeps the running value inside 32 bits.
+//
+// The signed kernels bias by 0x80 where the arithmetic allows it: that maps int8 onto
+// uint8 without changing any difference between two elements, so L2 and L1 become the
+// unsigned kernel plus one XOR per vector. Dot and cosine need the true signed values.
+static inline __m256i abs_diff_epu8 (__m256i a, __m256i b) {
+    return _mm256_or_si256(_mm256_subs_epu8(a, b), _mm256_subs_epu8(b, a));
+}
+
+static inline uint64_t hsum256_epi64 (__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i s = _mm_add_epi64(lo, hi);
+    return (uint64_t)_mm_cvtsi128_si64(s) + (uint64_t)_mm_extract_epi64(s, 1);
+}
+
+// The reductions widen to 64 bits before summing the lanes. Each lane is itself a running
+// total, so folding eight of them in 32 bits would cap the usable dimension far below
+// what the per-lane accumulators can hold.
+static inline uint64_t hsum256_epi32 (__m256i v) {
+    const __m256i zero = _mm256_setzero_si256();
+    return hsum256_epi64(_mm256_add_epi64(_mm256_unpacklo_epi32(v, zero), _mm256_unpackhi_epi32(v, zero)));
+}
+
+static inline int64_t hsum256_epi32_signed (__m256i v) {
+    __m256i wl = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(v));
+    __m256i wh = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(v, 1));
+    __m256i s = _mm256_add_epi64(wl, wh);
+    __m128i lo = _mm256_castsi256_si128(s);
+    __m128i hi = _mm256_extracti128_si256(s, 1);
+    __m128i r = _mm_add_epi64(lo, hi);
+    return (int64_t)_mm_cvtsi128_si64(r) + (int64_t)_mm_extract_epi64(r, 1);
+}
+
+// sum of squared differences of 32 bytes, accumulated 32 bits wide
+static inline __m256i sqdiff_epu8 (__m256i a, __m256i b) {
+    __m256i d = abs_diff_epu8(a, b);
+    __m256i lo = _mm256_unpacklo_epi8(d, _mm256_setzero_si256());
+    __m256i hi = _mm256_unpackhi_epi8(d, _mm256_setzero_si256());
+    return _mm256_add_epi32(_mm256_madd_epi16(lo, lo), _mm256_madd_epi16(hi, hi));
+}
+
 static inline float uint8_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
-    
-    __m256i acc = _mm256_setzero_si256();
+
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0;
     int i = 0;
-    
-    for (; i <= n - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-        
-        // Split into 2 x 128-bit chunks
-        __m128i va_lo = _mm256_extracti128_si256(va, 0);
-        __m128i va_hi = _mm256_extracti128_si256(va, 1);
-        __m128i vb_lo = _mm256_extracti128_si256(vb, 0);
-        __m128i vb_hi = _mm256_extracti128_si256(vb, 1);
-        
-        // Unpack to 16-bit integers
-        __m128i va_lo_u16 = _mm_unpacklo_epi8(va_lo, _mm_setzero_si128());
-        __m128i va_hi_u16 = _mm_unpackhi_epi8(va_lo, _mm_setzero_si128());
-        __m128i vb_lo_u16 = _mm_unpacklo_epi8(vb_lo, _mm_setzero_si128());
-        __m128i vb_hi_u16 = _mm_unpackhi_epi8(vb_lo, _mm_setzero_si128());
-        
-        __m128i va_lo_u16_hi = _mm_unpacklo_epi8(va_hi, _mm_setzero_si128());
-        __m128i va_hi_u16_hi = _mm_unpackhi_epi8(va_hi, _mm_setzero_si128());
-        __m128i vb_lo_u16_hi = _mm_unpacklo_epi8(vb_hi, _mm_setzero_si128());
-        __m128i vb_hi_u16_hi = _mm_unpackhi_epi8(vb_hi, _mm_setzero_si128());
-        
-        // Compute diffs
-        __m128i d0 = _mm_sub_epi16(va_lo_u16, vb_lo_u16);
-        __m128i d1 = _mm_sub_epi16(va_hi_u16, vb_hi_u16);
-        __m128i d2 = _mm_sub_epi16(va_lo_u16_hi, vb_lo_u16_hi);
-        __m128i d3 = _mm_sub_epi16(va_hi_u16_hi, vb_hi_u16_hi);
-        
-        // Square diffs
-        __m128i s0 = _mm_mullo_epi16(d0, d0);
-        __m128i s1 = _mm_mullo_epi16(d1, d1);
-        __m128i s2 = _mm_mullo_epi16(d2, d2);
-        __m128i s3 = _mm_mullo_epi16(d3, d3);
-        
-        // Widen to 32-bit and accumulate
-        __m256i w0 = _mm256_cvtepu16_epi32(s0);
-        __m256i w1 = _mm256_cvtepu16_epi32(s1);
-        __m256i w2 = _mm256_cvtepu16_epi32(s2);
-        __m256i w3 = _mm256_cvtepu16_epi32(s3);
-        
-        acc = _mm256_add_epi32(acc, w0);
-        acc = _mm256_add_epi32(acc, w1);
-        acc = _mm256_add_epi32(acc, w2);
-        acc = _mm256_add_epi32(acc, w3);
+
+    for (; i <= n - 64; i += 64) {
+        acc0 = _mm256_add_epi32(acc0, sqdiff_epu8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                                  _mm256_loadu_si256((const __m256i *)(b + i))));
+        acc1 = _mm256_add_epi32(acc1, sqdiff_epu8(_mm256_loadu_si256((const __m256i *)(a + i + 32)),
+                                                  _mm256_loadu_si256((const __m256i *)(b + i + 32))));
     }
-    
-    // Horizontal sum of 8 x 32-bit integers
-    uint32_t temp[8];
-    _mm256_storeu_si256((__m256i *)temp, acc);
-    uint32_t total = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
-    
-    // Tail loop
+    for (; i <= n - 32; i += 32) {
+        acc0 = _mm256_add_epi32(acc0, sqdiff_epu8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                                  _mm256_loadu_si256((const __m256i *)(b + i))));
+    }
+
+    uint64_t total = hsum256_epi32(_mm256_add_epi32(acc0, acc1));
+
     for (; i < n; ++i) {
         int d = (int)a[i] - (int)b[i];
-        total += d * d;
+        total += (uint64_t)(d * d);
     }
-    
+
     return use_sqrt ? sqrtf((float)total) : (float)total;
 }
 
@@ -717,98 +726,96 @@ float uint8_distance_l2_squared_avx2 (const void *v1, const void *v2, int n) {
     return uint8_distance_l2_impl_avx2(v1, v2, n, false);
 }
 
+// widening dot product of 32 unsigned bytes
+static inline __m256i dot_epu8 (__m256i a, __m256i b) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256i al = _mm256_unpacklo_epi8(a, zero), ah = _mm256_unpackhi_epi8(a, zero);
+    __m256i bl = _mm256_unpacklo_epi8(b, zero), bh = _mm256_unpackhi_epi8(b, zero);
+    return _mm256_add_epi32(_mm256_madd_epi16(al, bl), _mm256_madd_epi16(ah, bh));
+}
+
 float uint8_distance_dot_avx2 (const void *v1, const void *v2, int n) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
-    
-    __m256i acc = _mm256_setzero_si256();
+
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0;
     int i = 0;
 
+    for (; i <= n - 64; i += 64) {
+        acc0 = _mm256_add_epi32(acc0, dot_epu8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                               _mm256_loadu_si256((const __m256i *)(b + i))));
+        acc1 = _mm256_add_epi32(acc1, dot_epu8(_mm256_loadu_si256((const __m256i *)(a + i + 32)),
+                                               _mm256_loadu_si256((const __m256i *)(b + i + 32))));
+    }
     for (; i <= n - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-
-        __m256i a_lo = _mm256_unpacklo_epi8(va, _mm256_setzero_si256());
-        __m256i a_hi = _mm256_unpackhi_epi8(va, _mm256_setzero_si256());
-        __m256i b_lo = _mm256_unpacklo_epi8(vb, _mm256_setzero_si256());
-        __m256i b_hi = _mm256_unpackhi_epi8(vb, _mm256_setzero_si256());
-
-        __m256i prod_lo = _mm256_mullo_epi16(a_lo, b_lo);
-        __m256i prod_hi = _mm256_mullo_epi16(a_hi, b_hi);
-
-        __m256i prod_lo_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(prod_lo, 0));
-        __m256i prod_hi_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(prod_lo, 1));
-        acc = _mm256_add_epi32(acc, prod_lo_32);
-        acc = _mm256_add_epi32(acc, prod_hi_32);
-
-        prod_lo_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(prod_hi, 0));
-        prod_hi_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(prod_hi, 1));
-        acc = _mm256_add_epi32(acc, prod_lo_32);
-        acc = _mm256_add_epi32(acc, prod_hi_32);
+        acc0 = _mm256_add_epi32(acc0, dot_epu8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                               _mm256_loadu_si256((const __m256i *)(b + i))));
     }
 
-    uint32_t temp[8];
-    _mm256_storeu_si256((__m256i *)temp, acc);
-    uint32_t total = temp[0] + temp[1] + temp[2] + temp[3] +
-                     temp[4] + temp[5] + temp[6] + temp[7];
+    uint64_t dot = hsum256_epi32(_mm256_add_epi32(acc0, acc1));
 
-    for (; i < n; ++i) {
-        total += a[i] * b[i];
-    }
+    for (; i < n; ++i) dot += (uint64_t)((uint32_t)a[i] * (uint32_t)b[i]);
 
-    return -(float)total;
+    return -(float)dot;
 }
 
 float uint8_distance_l1_avx2 (const void *v1, const void *v2, int n) {
     const uint8_t *a = (const uint8_t *)v1;
     const uint8_t *b = (const uint8_t *)v2;
-    
-    __m256i acc = _mm256_setzero_si256();
+
+    // PSADBW already sums absolute differences into 64-bit lanes: one instruction per
+    // 32 bytes, and it cannot overflow for any vector length we support
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0;
     int i = 0;
 
+    for (; i <= n - 64; i += 64) {
+        acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                                      _mm256_loadu_si256((const __m256i *)(b + i))));
+        acc1 = _mm256_add_epi64(acc1, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)(a + i + 32)),
+                                                      _mm256_loadu_si256((const __m256i *)(b + i + 32))));
+    }
     for (; i <= n - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-
-        __m256i a_lo = _mm256_unpacklo_epi8(va, _mm256_setzero_si256());
-        __m256i a_hi = _mm256_unpackhi_epi8(va, _mm256_setzero_si256());
-        __m256i b_lo = _mm256_unpacklo_epi8(vb, _mm256_setzero_si256());
-        __m256i b_hi = _mm256_unpackhi_epi8(vb, _mm256_setzero_si256());
-
-        __m256i diff_lo = _mm256_abs_epi16(_mm256_sub_epi16(a_lo, b_lo));
-        __m256i diff_hi = _mm256_abs_epi16(_mm256_sub_epi16(a_hi, b_hi));
-
-        __m256i diff_lo_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(diff_lo, 0));
-        __m256i diff_hi_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(diff_lo, 1));
-        acc = _mm256_add_epi32(acc, diff_lo_32);
-        acc = _mm256_add_epi32(acc, diff_hi_32);
-
-        diff_lo_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(diff_hi, 0));
-        diff_hi_32 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(diff_hi, 1));
-        acc = _mm256_add_epi32(acc, diff_lo_32);
-        acc = _mm256_add_epi32(acc, diff_hi_32);
+        acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                                      _mm256_loadu_si256((const __m256i *)(b + i))));
     }
 
-    uint32_t temp[8];
-    _mm256_storeu_si256((__m256i *)temp, acc);
-    uint32_t total = temp[0] + temp[1] + temp[2] + temp[3] +
-                     temp[4] + temp[5] + temp[6] + temp[7];
+    uint64_t sum = hsum256_epi64(_mm256_add_epi64(acc0, acc1));
 
-    for (; i < n; ++i) {
-        total += abs((int)a[i] - (int)b[i]);
-    }
+    for (; i < n; ++i) sum += (uint64_t)abs((int)a[i] - (int)b[i]);
 
-    return (float)total;
+    return (float)sum;
 }
 
 float uint8_distance_cosine_avx2 (const void *a, const void *b, int n) {
-    float dot = -uint8_distance_dot_avx2(a, b, n);
-    float norm_a = sqrtf(-uint8_distance_dot_avx2(a, a, n));
-    float norm_b = sqrtf(-uint8_distance_dot_avx2(b, b, n));
+    const uint8_t *x = (const uint8_t *)a;
+    const uint8_t *y = (const uint8_t *)b;
 
-    if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
+    // one fused pass rather than three calls to the dot kernel
+    __m256i dacc = _mm256_setzero_si256(), aacc = dacc, bacc = dacc;
+    int i = 0;
 
-    float cosine_similarity = dot / (norm_a * norm_b);
+    for (; i <= n - 32; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(x + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(y + i));
+        dacc = _mm256_add_epi32(dacc, dot_epu8(va, vb));
+        aacc = _mm256_add_epi32(aacc, dot_epu8(va, va));
+        bacc = _mm256_add_epi32(bacc, dot_epu8(vb, vb));
+    }
+
+    uint64_t dot = hsum256_epi32(dacc);
+    uint64_t norm_a = hsum256_epi32(aacc);
+    uint64_t norm_b = hsum256_epi32(bacc);
+
+    for (; i < n; ++i) {
+        uint32_t p = x[i], q = y[i];
+        dot += (uint64_t)(p * q);
+        norm_a += (uint64_t)(p * p);
+        norm_b += (uint64_t)(q * q);
+    }
+
+    if (norm_a == 0 || norm_b == 0) return 1.0f;
+
+    float cosine_similarity = (float)((double)dot / (sqrt((double)norm_a) * sqrt((double)norm_b)));
     if (cosine_similarity > 1.0f) cosine_similarity = 1.0f;
     if (cosine_similarity < -1.0f) cosine_similarity = -1.0f;
     return 1.0f - cosine_similarity;
@@ -816,69 +823,31 @@ float uint8_distance_cosine_avx2 (const void *a, const void *b, int n) {
 
 // MARK: - INT8 -
 
+#define S8_TO_BIASED_U8_AVX2(_v)            _mm256_xor_si256((_v), _mm256_set1_epi8((char)0x80))
+
 static inline float int8_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
-    __m256i acc = _mm256_setzero_si256();
+
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0;
     int i = 0;
 
+    for (; i <= n - 64; i += 64) {
+        acc0 = _mm256_add_epi32(acc0, sqdiff_epu8(S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(a + i))),
+                                                  S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(b + i)))));
+        acc1 = _mm256_add_epi32(acc1, sqdiff_epu8(S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(a + i + 32))),
+                                                  S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(b + i + 32)))));
+    }
     for (; i <= n - 32; i += 32) {
-        // Load 32 int8_t elements from each input
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-
-        // Extract 128-bit halves
-        __m128i va_lo = _mm256_extracti128_si256(va, 0);
-        __m128i va_hi = _mm256_extracti128_si256(va, 1);
-        __m128i vb_lo = _mm256_extracti128_si256(vb, 0);
-        __m128i vb_hi = _mm256_extracti128_si256(vb, 1);
-
-        // Sign-extend int8_t to int16_t
-        __m128i va_lo_s16 = _mm_cvtepi8_epi16(va_lo);
-        __m128i va_hi_s16 = _mm_cvtepi8_epi16(_mm_srli_si128(va_lo, 8));
-        __m128i vb_lo_s16 = _mm_cvtepi8_epi16(vb_lo);
-        __m128i vb_hi_s16 = _mm_cvtepi8_epi16(_mm_srli_si128(vb_lo, 8));
-
-        __m128i va_lo_s16_hi = _mm_cvtepi8_epi16(va_hi);
-        __m128i va_hi_s16_hi = _mm_cvtepi8_epi16(_mm_srli_si128(va_hi, 8));
-        __m128i vb_lo_s16_hi = _mm_cvtepi8_epi16(vb_hi);
-        __m128i vb_hi_s16_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vb_hi, 8));
-
-        // Compute differences
-        __m128i d0 = _mm_sub_epi16(va_lo_s16, vb_lo_s16);
-        __m128i d1 = _mm_sub_epi16(va_hi_s16, vb_hi_s16);
-        __m128i d2 = _mm_sub_epi16(va_lo_s16_hi, vb_lo_s16_hi);
-        __m128i d3 = _mm_sub_epi16(va_hi_s16_hi, vb_hi_s16_hi);
-
-        // Square differences
-        __m128i s0 = _mm_mullo_epi16(d0, d0);
-        __m128i s1 = _mm_mullo_epi16(d1, d1);
-        __m128i s2 = _mm_mullo_epi16(d2, d2);
-        __m128i s3 = _mm_mullo_epi16(d3, d3);
-
-        // Extend to 32-bit and accumulate
-        __m256i w0 = _mm256_cvtepu16_epi32(s0);
-        __m256i w1 = _mm256_cvtepu16_epi32(s1);
-        __m256i w2 = _mm256_cvtepu16_epi32(s2);
-        __m256i w3 = _mm256_cvtepu16_epi32(s3);
-
-        acc = _mm256_add_epi32(acc, w0);
-        acc = _mm256_add_epi32(acc, w1);
-        acc = _mm256_add_epi32(acc, w2);
-        acc = _mm256_add_epi32(acc, w3);
+        acc0 = _mm256_add_epi32(acc0, sqdiff_epu8(S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(a + i))),
+                                                  S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(b + i)))));
     }
 
-    // Horizontal sum
-    uint32_t temp[8];
-    _mm256_storeu_si256((__m256i *)temp, acc);
-    uint32_t total = temp[0] + temp[1] + temp[2] + temp[3] +
-                     temp[4] + temp[5] + temp[6] + temp[7];
+    uint64_t total = hsum256_epi32(_mm256_add_epi32(acc0, acc1));
 
-    // Scalar tail
     for (; i < n; ++i) {
         int d = (int)a[i] - (int)b[i];
-        total += d * d;
+        total += (uint64_t)(d * d);
     }
 
     return use_sqrt ? sqrtf((float)total) : (float)total;
@@ -892,122 +861,95 @@ float int8_distance_l2_squared_avx2 (const void *v1, const void *v2, int n) {
     return int8_distance_l2_impl_avx2(v1, v2, n, false);
 }
 
+// widening dot product of 32 signed bytes: sign-extend each half, then PMADDWD
+static inline __m256i dot_epi8 (__m256i a, __m256i b) {
+    __m256i al = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a));
+    __m256i ah = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 1));
+    __m256i bl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b));
+    __m256i bh = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b, 1));
+    return _mm256_add_epi32(_mm256_madd_epi16(al, bl), _mm256_madd_epi16(ah, bh));
+}
+
 float int8_distance_dot_avx2 (const void *v1, const void *v2, int n) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
-    __m256i acc = _mm256_setzero_si256();
+
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0;
     int i = 0;
 
+    for (; i <= n - 64; i += 64) {
+        acc0 = _mm256_add_epi32(acc0, dot_epi8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                               _mm256_loadu_si256((const __m256i *)(b + i))));
+        acc1 = _mm256_add_epi32(acc1, dot_epi8(_mm256_loadu_si256((const __m256i *)(a + i + 32)),
+                                               _mm256_loadu_si256((const __m256i *)(b + i + 32))));
+    }
     for (; i <= n - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-
-        __m128i va_lo = _mm256_extracti128_si256(va, 0);
-        __m128i va_hi = _mm256_extracti128_si256(va, 1);
-        __m128i vb_lo = _mm256_extracti128_si256(vb, 0);
-        __m128i vb_hi = _mm256_extracti128_si256(vb, 1);
-
-        __m128i a0 = _mm_cvtepi8_epi16(va_lo);
-        __m128i a1 = _mm_cvtepi8_epi16(_mm_srli_si128(va_lo, 8));
-        __m128i b0 = _mm_cvtepi8_epi16(vb_lo);
-        __m128i b1 = _mm_cvtepi8_epi16(_mm_srli_si128(vb_lo, 8));
-
-        __m128i a2 = _mm_cvtepi8_epi16(va_hi);
-        __m128i a3 = _mm_cvtepi8_epi16(_mm_srli_si128(va_hi, 8));
-        __m128i b2 = _mm_cvtepi8_epi16(vb_hi);
-        __m128i b3 = _mm_cvtepi8_epi16(_mm_srli_si128(vb_hi, 8));
-
-        __m128i p0 = _mm_mullo_epi16(a0, b0);
-        __m128i p1 = _mm_mullo_epi16(a1, b1);
-        __m128i p2 = _mm_mullo_epi16(a2, b2);
-        __m128i p3 = _mm_mullo_epi16(a3, b3);
-
-        __m256i w0 = _mm256_cvtepi16_epi32(p0);
-        __m256i w1 = _mm256_cvtepi16_epi32(p1);
-        __m256i w2 = _mm256_cvtepi16_epi32(p2);
-        __m256i w3 = _mm256_cvtepi16_epi32(p3);
-
-        acc = _mm256_add_epi32(acc, w0);
-        acc = _mm256_add_epi32(acc, w1);
-        acc = _mm256_add_epi32(acc, w2);
-        acc = _mm256_add_epi32(acc, w3);
+        acc0 = _mm256_add_epi32(acc0, dot_epi8(_mm256_loadu_si256((const __m256i *)(a + i)),
+                                               _mm256_loadu_si256((const __m256i *)(b + i))));
     }
 
-    uint32_t temp[8];
-    _mm256_storeu_si256((__m256i *)temp, acc);
-    int32_t total = temp[0] + temp[1] + temp[2] + temp[3] +
-                    temp[4] + temp[5] + temp[6] + temp[7];
+    int64_t dot = hsum256_epi32_signed(_mm256_add_epi32(acc0, acc1));
 
-    for (; i < n; ++i) {
-        total += (int)a[i] * (int)b[i];
-    }
+    for (; i < n; ++i) dot += (int64_t)((int32_t)a[i] * (int32_t)b[i]);
 
-    return -(float)total;
+    return -(float)dot;
 }
 
 float int8_distance_l1_avx2 (const void *v1, const void *v2, int n) {
     const int8_t *a = (const int8_t *)v1;
     const int8_t *b = (const int8_t *)v2;
-    
-    __m256i acc = _mm256_setzero_si256();
+
+    // same biasing trick as L2, so PSADBW applies unchanged
+    __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0;
     int i = 0;
 
+    for (; i <= n - 64; i += 64) {
+        acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(a + i))),
+                                                      S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(b + i)))));
+        acc1 = _mm256_add_epi64(acc1, _mm256_sad_epu8(S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(a + i + 32))),
+                                                      S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(b + i + 32)))));
+    }
     for (; i <= n - 32; i += 32) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-
-        __m128i va_lo = _mm256_extracti128_si256(va, 0);
-        __m128i va_hi = _mm256_extracti128_si256(va, 1);
-        __m128i vb_lo = _mm256_extracti128_si256(vb, 0);
-        __m128i vb_hi = _mm256_extracti128_si256(vb, 1);
-
-        __m128i a0 = _mm_cvtepi8_epi16(va_lo);
-        __m128i a1 = _mm_cvtepi8_epi16(_mm_srli_si128(va_lo, 8));
-        __m128i b0 = _mm_cvtepi8_epi16(vb_lo);
-        __m128i b1 = _mm_cvtepi8_epi16(_mm_srli_si128(vb_lo, 8));
-
-        __m128i a2 = _mm_cvtepi8_epi16(va_hi);
-        __m128i a3 = _mm_cvtepi8_epi16(_mm_srli_si128(va_hi, 8));
-        __m128i b2 = _mm_cvtepi8_epi16(vb_hi);
-        __m128i b3 = _mm_cvtepi8_epi16(_mm_srli_si128(vb_hi, 8));
-
-        __m128i d0 = _mm_abs_epi16(_mm_sub_epi16(a0, b0));
-        __m128i d1 = _mm_abs_epi16(_mm_sub_epi16(a1, b1));
-        __m128i d2 = _mm_abs_epi16(_mm_sub_epi16(a2, b2));
-        __m128i d3 = _mm_abs_epi16(_mm_sub_epi16(a3, b3));
-
-        __m256i w0 = _mm256_cvtepu16_epi32(d0);
-        __m256i w1 = _mm256_cvtepu16_epi32(d1);
-        __m256i w2 = _mm256_cvtepu16_epi32(d2);
-        __m256i w3 = _mm256_cvtepu16_epi32(d3);
-
-        acc = _mm256_add_epi32(acc, w0);
-        acc = _mm256_add_epi32(acc, w1);
-        acc = _mm256_add_epi32(acc, w2);
-        acc = _mm256_add_epi32(acc, w3);
+        acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(a + i))),
+                                                      S8_TO_BIASED_U8_AVX2(_mm256_loadu_si256((const __m256i *)(b + i)))));
     }
 
-    uint32_t temp[8];
-    _mm256_storeu_si256((__m256i *)temp, acc);
-    int32_t total = temp[0] + temp[1] + temp[2] + temp[3] +
-                    temp[4] + temp[5] + temp[6] + temp[7];
+    uint64_t sum = hsum256_epi64(_mm256_add_epi64(acc0, acc1));
 
-    for (; i < n; ++i) {
-        total += abs((int)a[i] - (int)b[i]);
-    }
+    for (; i < n; ++i) sum += (uint64_t)abs((int)a[i] - (int)b[i]);
 
-    return (float)total;
+    return (float)sum;
 }
 
 float int8_distance_cosine_avx2 (const void *a, const void *b, int n) {
-    float dot = -int8_distance_dot_avx2(a, b, n);
-    float norm_a = sqrtf(-int8_distance_dot_avx2(a, a, n));
-    float norm_b = sqrtf(-int8_distance_dot_avx2(b, b, n));
+    const int8_t *x = (const int8_t *)a;
+    const int8_t *y = (const int8_t *)b;
 
-    if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
+    __m256i dacc = _mm256_setzero_si256(), aacc = dacc, bacc = dacc;
+    int i = 0;
 
-    float cosine_similarity = dot / (norm_a * norm_b);
+    for (; i <= n - 32; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(x + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(y + i));
+        dacc = _mm256_add_epi32(dacc, dot_epi8(va, vb));
+        aacc = _mm256_add_epi32(aacc, dot_epi8(va, va));
+        bacc = _mm256_add_epi32(bacc, dot_epi8(vb, vb));
+    }
+
+    int64_t dot = hsum256_epi32_signed(dacc);
+    int64_t norm_a = hsum256_epi32_signed(aacc);
+    int64_t norm_b = hsum256_epi32_signed(bacc);
+
+    for (; i < n; ++i) {
+        int32_t p = x[i], q = y[i];
+        dot += (int64_t)(p * q);
+        norm_a += (int64_t)(p * p);
+        norm_b += (int64_t)(q * q);
+    }
+
+    if (norm_a == 0 || norm_b == 0) return 1.0f;
+
+    float cosine_similarity = (float)((double)dot / (sqrt((double)norm_a) * sqrt((double)norm_b)));
     if (cosine_similarity > 1.0f) cosine_similarity = 1.0f;
     if (cosine_similarity < -1.0f) cosine_similarity = -1.0f;
     return 1.0f - cosine_similarity;
