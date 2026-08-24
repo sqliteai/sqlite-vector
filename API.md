@@ -22,7 +22,7 @@ Returns the current version of the SQLite Vector Extension.
 
 ```sql
 SELECT vector_version();
--- e.g., '1.0.0'
+-- e.g., '1.1.0'
 ```
 
 ---
