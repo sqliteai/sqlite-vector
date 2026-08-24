@@ -119,6 +119,10 @@ INSERT INTO images (embedding, label) VALUES (vector_as_f32('[0.3, 1.0, 0.9, 3.2
 -- distance=L1, distance=COSINE, distance=DOT, distance=SQUARED_L2, or distance=HAMMING.
 SELECT vector_init('images', 'embedding', 'type=FLOAT32,dimension=384');
 
+-- If your embeddings are already unit length, say so: FLOAT32 cosine scans then compute
+-- 1 - dot instead of the full cosine, with the same results.
+-- SELECT vector_init('images', 'embedding', 'type=FLOAT32,dimension=384,distance=COSINE,normalized=1');
+
 -- Quantize vector
 SELECT vector_quantize('images', 'embedding');
 

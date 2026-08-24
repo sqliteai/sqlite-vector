@@ -104,12 +104,22 @@ This ensures that each vector can be uniquely identified and efficiently referen
   * `COSINE`
   * `DOT`
   * `L1`
-  * `HAMMING`
+  * `HAMMING` (only valid with `type=1BIT`)
+* `normalized`: Set to `1` to declare that every stored vector is unit length. With
+  `type=FLOAT32` and `distance=COSINE` this lets a full-precision scan compute
+  `1 - dot` instead of the full cosine, dropping two thirds of the arithmetic from the
+  inner loop; the query vector is normalized once per scan, so the reported distances are
+  unchanged. It is an assertion, not a request: if the stored vectors are *not* unit
+  length the distances will be wrong. Quantized scans ignore it, because the quantized
+  index holds scaled integers whose norm is not 1. Default `0`.
 
 **Example:**
 
 ```sql
 SELECT vector_init('documents', 'embedding', 'dimension=384,type=FLOAT32,distance=cosine');
+
+-- embeddings already normalized by the model: faster cosine, same results
+SELECT vector_init('documents', 'embedding', 'dimension=384,type=FLOAT32,distance=cosine,normalized=1');
 ```
 
 ---
