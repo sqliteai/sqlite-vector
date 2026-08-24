@@ -20,11 +20,6 @@ extern const char *turbo_lut_backend_name;
 
 #define _mm256_abs_ps(x) _mm256_andnot_ps(_mm256_set1_ps(-0.0f), (x))
 
-static inline __m256 mm256_abs_ps(__m256 x) {
-    const __m256 mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    return _mm256_and_ps(x, mask);
-}
-
 static inline double hsum256d(__m256d v) {
     __m128d lo = _mm256_castpd256_pd128(v);
     __m128d hi = _mm256_extractf128_pd(v, 1);
@@ -66,31 +61,54 @@ static inline bool block_has_l2_inf_mismatch_bf16_8(const uint16_t* a, const uin
 
 // MARK: - FLOAT32 -
 
+// A single accumulator makes the loop one dependency chain: an FMA has around four cycles
+// of latency, so it retires one vector every four cycles however many FMA ports the core
+// has. Four independent accumulators keep them fed and still fit sixteen YMM registers.
+#if defined(__FMA__)
+#define MM256_FMA_PS(_acc, _x, _y)          _mm256_fmadd_ps((_x), (_y), (_acc))
+#else
+#define MM256_FMA_PS(_acc, _x, _y)          _mm256_add_ps((_acc), _mm256_mul_ps((_x), (_y)))
+#endif
+
+static inline float hsum256_ps (__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    return _mm_cvtss_f32(s);
+}
+
 static inline float float32_distance_l2_impl_avx2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    __m256 acc = _mm256_setzero_ps();
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     int i = 0;
 
+    for (; i <= n - 32; i += 32) {
+        __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i     ), _mm256_loadu_ps(b + i     ));
+        __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i +  8), _mm256_loadu_ps(b + i +  8));
+        __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
+        __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
+        acc0 = MM256_FMA_PS(acc0, d0, d0);
+        acc1 = MM256_FMA_PS(acc1, d1, d1);
+        acc2 = MM256_FMA_PS(acc2, d2, d2);
+        acc3 = MM256_FMA_PS(acc3, d3, d3);
+    }
     for (; i <= n - 8; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        __m256 diff = _mm256_sub_ps(va, vb);
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+        __m256 d = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        acc0 = MM256_FMA_PS(acc0, d, d);
     }
 
-    float temp[8];
-    _mm256_storeu_ps(temp, acc);
-    float total = temp[0] + temp[1] + temp[2] + temp[3] +
-                  temp[4] + temp[5] + temp[6] + temp[7];
+    float total = hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
 
     for (; i < n; ++i) {
         float d = a[i] - b[i];
         total += d * d;
     }
 
-    return use_sqrt ? sqrtf((float)total) : (float)total;
+    return use_sqrt ? sqrtf(total) : total;
 }
 
 float float32_distance_l2_avx2 (const void *v1, const void *v2, int n) {
@@ -104,21 +122,26 @@ float float32_distance_l2_squared_avx2 (const void *v1, const void *v2, int n) {
 float float32_distance_l1_avx2 (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    __m256 acc = _mm256_setzero_ps();
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     int i = 0;
 
+    for (; i <= n - 32; i += 32) {
+        __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i     ), _mm256_loadu_ps(b + i     ));
+        __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i +  8), _mm256_loadu_ps(b + i +  8));
+        __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
+        __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
+        acc0 = _mm256_add_ps(acc0, _mm256_abs_ps(d0));
+        acc1 = _mm256_add_ps(acc1, _mm256_abs_ps(d1));
+        acc2 = _mm256_add_ps(acc2, _mm256_abs_ps(d2));
+        acc3 = _mm256_add_ps(acc3, _mm256_abs_ps(d3));
+    }
     for (; i <= n - 8; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        __m256 diff = _mm256_sub_ps(va, vb);
-        acc = _mm256_add_ps(acc, _mm256_abs_ps(diff));
+        __m256 d = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        acc0 = _mm256_add_ps(acc0, _mm256_abs_ps(d));
     }
 
-    float temp[8];
-    _mm256_storeu_ps(temp, acc);
-    float total = temp[0] + temp[1] + temp[2] + temp[3] +
-                  temp[4] + temp[5] + temp[6] + temp[7];
+    float total = hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
 
     for (; i < n; ++i) {
         total += fabsf(a[i] - b[i]);
@@ -130,20 +153,21 @@ float float32_distance_l1_avx2 (const void *v1, const void *v2, int n) {
 float float32_distance_dot_avx2 (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    __m256 acc = _mm256_setzero_ps();
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     int i = 0;
 
+    for (; i <= n - 32; i += 32) {
+        acc0 = MM256_FMA_PS(acc0, _mm256_loadu_ps(a + i     ), _mm256_loadu_ps(b + i     ));
+        acc1 = MM256_FMA_PS(acc1, _mm256_loadu_ps(a + i +  8), _mm256_loadu_ps(b + i +  8));
+        acc2 = MM256_FMA_PS(acc2, _mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
+        acc3 = MM256_FMA_PS(acc3, _mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
+    }
     for (; i <= n - 8; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+        acc0 = MM256_FMA_PS(acc0, _mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
     }
 
-    float temp[8];
-    _mm256_storeu_ps(temp, acc);
-    float total = temp[0] + temp[1] + temp[2] + temp[3] +
-                  temp[4] + temp[5] + temp[6] + temp[7];
+    float total = hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
 
     for (; i < n; ++i) {
         total += a[i] * b[i];
@@ -153,13 +177,45 @@ float float32_distance_dot_avx2 (const void *v1, const void *v2, int n) {
 }
 
 float float32_distance_cosine_avx2 (const void *a, const void *b, int n) {
-    float dot = -float32_distance_dot_avx2(a, b, n);
-    float norm_a = sqrtf(-float32_distance_dot_avx2(a, a, n));
-    float norm_b = sqrtf(-float32_distance_dot_avx2(b, b, n));
+    const float *x = (const float *)a;
+    const float *y = (const float *)b;
+
+    // one fused pass, not three calls to the dot kernel: the data is read once instead of
+    // three times, which is what actually costs on anything larger than L1
+    __m256 dot0 = _mm256_setzero_ps(), dot1 = dot0;
+    __m256 na0 = dot0, na1 = dot0;
+    __m256 nb0 = dot0, nb1 = dot0;
+    int i = 0;
+
+    for (; i <= n - 16; i += 16) {
+        __m256 a0 = _mm256_loadu_ps(x + i), a1 = _mm256_loadu_ps(x + i + 8);
+        __m256 b0 = _mm256_loadu_ps(y + i), b1 = _mm256_loadu_ps(y + i + 8);
+        dot0 = MM256_FMA_PS(dot0, a0, b0);  dot1 = MM256_FMA_PS(dot1, a1, b1);
+        na0  = MM256_FMA_PS(na0,  a0, a0);  na1  = MM256_FMA_PS(na1,  a1, a1);
+        nb0  = MM256_FMA_PS(nb0,  b0, b0);  nb1  = MM256_FMA_PS(nb1,  b1, b1);
+    }
+    for (; i <= n - 8; i += 8) {
+        __m256 va = _mm256_loadu_ps(x + i), vb = _mm256_loadu_ps(y + i);
+        dot0 = MM256_FMA_PS(dot0, va, vb);
+        na0  = MM256_FMA_PS(na0,  va, va);
+        nb0  = MM256_FMA_PS(nb0,  vb, vb);
+    }
+
+    float dot = hsum256_ps(_mm256_add_ps(dot0, dot1));
+    float norm_a = hsum256_ps(_mm256_add_ps(na0, na1));
+    float norm_b = hsum256_ps(_mm256_add_ps(nb0, nb1));
+
+    for (; i < n; ++i) {
+        float ai = x[i];
+        float bi = y[i];
+        dot    += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
 
     if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
 
-    float cosine_similarity = dot / (norm_a * norm_b);
+    float cosine_similarity = dot / (sqrtf(norm_a) * sqrtf(norm_b));
     if (cosine_similarity > 1.0f) cosine_similarity = 1.0f;
     if (cosine_similarity < -1.0f) cosine_similarity = -1.0f;
     return 1.0f - cosine_similarity;
@@ -1052,7 +1108,7 @@ float turbo_lut_dot_avx2 (const uint8_t *packed, float scale, const float *query
 
 // MARK: -
 
-void init_distance_functions_avx2 (void) {
+bool init_distance_functions_avx2 (void) {
 #if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F32] = float32_distance_l2_avx2;
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F16] = float16_distance_l2_avx2;
@@ -1089,5 +1145,8 @@ void init_distance_functions_avx2 (void) {
     distance_backend_name = "AVX2";
     turbo_lut_dot_function = turbo_lut_dot_avx2;
     turbo_lut_backend_name = "AVX2";
+    return true;
+#else
+    return false;
 #endif
 }

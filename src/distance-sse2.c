@@ -65,31 +65,41 @@ static inline __m128 bf16x4_to_f32x4_loadu(const uint16_t* p) {
 
 // MARK: - FLOAT32 -
 
+// A single accumulator makes the loop one dependency chain, so it retires one vector per
+// add latency however many ports the core has. Two independent accumulators double that
+// while still fitting the eight XMM registers available on 32-bit x86.
+static inline float hsum128_ps (__m128 v) {
+    __m128 s = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    return _mm_cvtss_f32(s);
+}
+
 static inline float float32_distance_l2_impl_sse2 (const void *v1, const void *v2, int n, bool use_sqrt) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    __m128 acc = _mm_setzero_ps();
+
+    __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
     int i = 0;
 
+    for (; i <= n - 8; i += 8) {
+        __m128 d0 = _mm_sub_ps(_mm_loadu_ps(a + i    ), _mm_loadu_ps(b + i    ));
+        __m128 d1 = _mm_sub_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4));
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(d0, d0));
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(d1, d1));
+    }
     for (; i <= n - 4; i += 4) {
-        __m128 va = _mm_loadu_ps(a + i);
-        __m128 vb = _mm_loadu_ps(b + i);
-        __m128 diff = _mm_sub_ps(va, vb);
-        __m128 sq = _mm_mul_ps(diff, diff);
-        acc = _mm_add_ps(acc, sq);
+        __m128 d = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(d, d));
     }
 
-    float partial[4];
-    _mm_storeu_ps(partial, acc);
-    float total = partial[0] + partial[1] + partial[2] + partial[3];
+    float total = hsum128_ps(_mm_add_ps(acc0, acc1));
 
     for (; i < n; ++i) {
         float d = a[i] - b[i];
         total += d * d;
     }
 
-    return use_sqrt ? sqrtf((float)total) : (float)total;
+    return use_sqrt ? sqrtf(total) : total;
 }
 
 float float32_distance_l2_sse2 (const void *v1, const void *v2, int n) {
@@ -103,21 +113,23 @@ float float32_distance_l2_squared_sse2 (const void *v1, const void *v2, int n) {
 float float32_distance_l1_sse2 (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    __m128 acc = _mm_setzero_ps();
+
+    const __m128 sign = _mm_set1_ps(-0.0f);
+    __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
     int i = 0;
 
+    for (; i <= n - 8; i += 8) {
+        __m128 d0 = _mm_sub_ps(_mm_loadu_ps(a + i    ), _mm_loadu_ps(b + i    ));
+        __m128 d1 = _mm_sub_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4));
+        acc0 = _mm_add_ps(acc0, _mm_andnot_ps(sign, d0));   // abs using bitmask
+        acc1 = _mm_add_ps(acc1, _mm_andnot_ps(sign, d1));
+    }
     for (; i <= n - 4; i += 4) {
-        __m128 va = _mm_loadu_ps(a + i);
-        __m128 vb = _mm_loadu_ps(b + i);
-        __m128 diff = _mm_sub_ps(va, vb);
-        __m128 abs_diff = _mm_andnot_ps(_mm_set1_ps(-0.0f), diff); // abs using bitmask
-        acc = _mm_add_ps(acc, abs_diff);
+        __m128 d = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
+        acc0 = _mm_add_ps(acc0, _mm_andnot_ps(sign, d));
     }
 
-    float partial[4];
-    _mm_storeu_ps(partial, acc);
-    float total = partial[0] + partial[1] + partial[2] + partial[3];
+    float total = hsum128_ps(_mm_add_ps(acc0, acc1));
 
     for (; i < n; ++i) {
         total += fabsf(a[i] - b[i]);
@@ -129,20 +141,19 @@ float float32_distance_l1_sse2 (const void *v1, const void *v2, int n) {
 float float32_distance_dot_sse2 (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
-    __m128 acc = _mm_setzero_ps();
+
+    __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
     int i = 0;
 
+    for (; i <= n - 8; i += 8) {
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_loadu_ps(a + i    ), _mm_loadu_ps(b + i    )));
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4)));
+    }
     for (; i <= n - 4; i += 4) {
-        __m128 va = _mm_loadu_ps(a + i);
-        __m128 vb = _mm_loadu_ps(b + i);
-        __m128 prod = _mm_mul_ps(va, vb);
-        acc = _mm_add_ps(acc, prod);
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
     }
 
-    float partial[4];
-    _mm_storeu_ps(partial, acc);
-    float total = partial[0] + partial[1] + partial[2] + partial[3];
+    float total = hsum128_ps(_mm_add_ps(acc0, acc1));
 
     for (; i < n; ++i) {
         total += a[i] * b[i];
@@ -154,7 +165,9 @@ float float32_distance_dot_sse2 (const void *v1, const void *v2, int n) {
 float float32_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
     const float *a = (const float *)v1;
     const float *b = (const float *)v2;
-    
+
+    // the three quantities are already independent chains, so one accumulator each keeps
+    // the register file within reach of 32-bit x86
     __m128 acc_dot = _mm_setzero_ps();
     __m128 acc_a2 = _mm_setzero_ps();
     __m128 acc_b2 = _mm_setzero_ps();
@@ -169,27 +182,24 @@ float float32_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
         acc_b2  = _mm_add_ps(acc_b2, _mm_mul_ps(vb, vb));
     }
 
-    float dot[4], a2[4], b2[4];
-    _mm_storeu_ps(dot, acc_dot);
-    _mm_storeu_ps(a2, acc_a2);
-    _mm_storeu_ps(b2, acc_b2);
-
-    float total_dot = dot[0] + dot[1] + dot[2] + dot[3];
-    float total_a2  = a2[0] + a2[1] + a2[2] + a2[3];
-    float total_b2  = b2[0] + b2[1] + b2[2] + b2[3];
+    float dot = hsum128_ps(acc_dot);
+    float norm_a = hsum128_ps(acc_a2);
+    float norm_b = hsum128_ps(acc_b2);
 
     for (; i < n; ++i) {
-        total_dot += a[i] * b[i];
-        total_a2  += a[i] * a[i];
-        total_b2  += b[i] * b[i];
+        float ai = a[i];
+        float bi = b[i];
+        dot    += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
     }
 
-    float denom = sqrtf(total_a2 * total_b2);
-    if (denom == 0.0f) return 1.0f;
-    float cosine_sim = total_dot / denom;
-    if (cosine_sim > 1.0f) cosine_sim = 1.0f;
-    if (cosine_sim < -1.0f) cosine_sim = -1.0f;
-    return 1.0f - cosine_sim;
+    if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
+
+    float cosine_similarity = dot / (sqrtf(norm_a) * sqrtf(norm_b));
+    if (cosine_similarity > 1.0f) cosine_similarity = 1.0f;
+    if (cosine_similarity < -1.0f) cosine_similarity = -1.0f;
+    return 1.0f - cosine_similarity;
 }
 
 // MARK: - FLOAT16 -
@@ -1125,7 +1135,7 @@ float turbo_lut_dot_sse2 (const uint8_t *packed, float scale, const float *query
 
 // MARK: -
 
-void init_distance_functions_sse2 (void) {
+bool init_distance_functions_sse2 (void) {
 #if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (_M_IX86_FP >= 2)))
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F32] = float32_distance_l2_sse2;
     dispatch_distance_table[VECTOR_DISTANCE_L2][VECTOR_TYPE_F16] = float16_distance_l2_sse2;
@@ -1162,5 +1172,8 @@ void init_distance_functions_sse2 (void) {
     distance_backend_name = "SSE2";
     turbo_lut_dot_function = turbo_lut_dot_sse2;
     turbo_lut_backend_name = "SSE2";
+    return true;
+#else
+    return false;
 #endif
 }

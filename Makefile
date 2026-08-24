@@ -102,6 +102,18 @@ ifneq (,$(findstring rv64,$(ARCH)))
 	CFLAGS += -march=$(ARCH)
 endif
 
+# The AVX2 and AVX-512 kernels are guarded by __AVX2__ / __AVX512F__, so without these
+# flags they compile to nothing and every x86 build falls back to the scalar kernels.
+# Enable the ISA for those two translation units only, so the baseline target of the
+# rest of the extension is unchanged: the runtime check in init_distance_functions()
+# still decides which set gets installed. Probing the compiler keeps this a no-op on
+# non-x86 targets and on multi-arch (universal) builds.
+AVX2_CFLAGS := $(shell $(CC) $(CFLAGS) -mavx2 -mfma -E -x c /dev/null >/dev/null 2>&1 && echo -mavx2 -mfma)
+AVX512_CFLAGS := $(shell $(CC) $(CFLAGS) -mavx512f -mavx512bw -mavx512vl -mavx512dq -E -x c /dev/null >/dev/null 2>&1 && echo -mavx512f -mavx512bw -mavx512vl -mavx512dq)
+
+$(BUILD_DIR)/distance-avx2.o: ISA_CFLAGS := $(AVX2_CFLAGS)
+$(BUILD_DIR)/distance-avx512.o: ISA_CFLAGS := $(AVX512_CFLAGS)
+
 # Windows .def file generation
 $(DEF_FILE):
 ifeq ($(PLATFORM),windows)
@@ -129,7 +141,7 @@ endif
 
 # Object files
 $(BUILD_DIR)/%.o: %.c
-	$(CC) $(CFLAGS) -O3 -fPIC -c $< -o $@
+	$(CC) $(CFLAGS) $(ISA_CFLAGS) -O3 -fPIC -c $< -o $@
 
 test: $(TARGET)
 	$(SQLITE3) ":memory:" -cmd ".bail on" ".load ./dist/vector" "SELECT vector_version();"
