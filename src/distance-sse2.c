@@ -1085,51 +1085,7 @@ float bit1_distance_hamming_sse2 (const void *v1, const void *v2, int n) {
     return (float)distance;
 }
 
-static inline uint16_t turbo_lut3_index_sse2 (const uint8_t *packed, int row, int packed_bytes) {
-    size_t bit_pos = (size_t)row * 12u;
-    size_t byte_pos = bit_pos / 8u;
-    int shift = (int)(bit_pos % 8u);
-    uint32_t word = 0;
-    if ((int)byte_pos < packed_bytes) word |= packed[byte_pos];
-    if ((int)byte_pos + 1 < packed_bytes) word |= (uint32_t)packed[byte_pos + 1] << 8;
-    return (uint16_t)((word >> shift) & 0x0fffu);
-}
 
-float turbo_lut_dot_sse2 (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes) {
-    __m128 acc = _mm_setzero_ps();
-    int r = 0;
-    if (bits == 3) {
-        for (; r + 3 < lut_rows; r += 4) {
-            float tmp[4] = {
-                query_lut[(size_t)(r + 0) * 4096u + turbo_lut3_index_sse2(packed, r + 0, packed_bytes)],
-                query_lut[(size_t)(r + 1) * 4096u + turbo_lut3_index_sse2(packed, r + 1, packed_bytes)],
-                query_lut[(size_t)(r + 2) * 4096u + turbo_lut3_index_sse2(packed, r + 2, packed_bytes)],
-                query_lut[(size_t)(r + 3) * 4096u + turbo_lut3_index_sse2(packed, r + 3, packed_bytes)]
-            };
-            acc = _mm_add_ps(acc, _mm_loadu_ps(tmp));
-        }
-    } else {
-        for (; r + 3 < lut_rows; r += 4) {
-            float tmp[4] = {
-                query_lut[(size_t)(r + 0) * 256u + packed[r + 0]],
-                query_lut[(size_t)(r + 1) * 256u + packed[r + 1]],
-                query_lut[(size_t)(r + 2) * 256u + packed[r + 2]],
-                query_lut[(size_t)(r + 3) * 256u + packed[r + 3]]
-            };
-            acc = _mm_add_ps(acc, _mm_loadu_ps(tmp));
-        }
-    }
-
-    float partial[4];
-    _mm_storeu_ps(partial, acc);
-    float dot = partial[0] + partial[1] + partial[2] + partial[3];
-    if (bits == 3) {
-        for (; r < lut_rows; ++r) dot += query_lut[(size_t)r * 4096u + turbo_lut3_index_sse2(packed, r, packed_bytes)];
-    } else {
-        for (; r < lut_rows; ++r) dot += query_lut[(size_t)r * 256u + packed[r]];
-    }
-    return dot * scale;
-}
 
 #endif
 
@@ -1170,7 +1126,8 @@ bool init_distance_functions_sse2 (void) {
     dispatch_distance_table[VECTOR_DISTANCE_HAMMING][VECTOR_TYPE_BIT] = bit1_distance_hamming_sse2;
     
     distance_backend_name = "SSE2";
-    turbo_lut_dot_function = turbo_lut_dot_sse2;
+    // the TurboQuant lookup scan is gather-bound and shared by every backend
+    turbo_lut_dot_function = turbo_lut_dot_cpu;
     turbo_lut_backend_name = "SSE2";
     return true;
 #else

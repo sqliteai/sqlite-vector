@@ -68,6 +68,7 @@ typedef float (*turbo_lut_dot_function_t)(const uint8_t *packed, float scale, co
 void init_distance_functions (bool force_cpu);
 
 extern turbo_lut_dot_function_t turbo_lut_dot_function;
+float turbo_lut_dot_cpu (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes);
 extern const char *turbo_lut_backend_name;
 
 // MARK: - FLOAT16/BFLOAT16 -
