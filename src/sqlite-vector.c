@@ -210,7 +210,6 @@ typedef struct {
     int64_t             *rowids;
     double              *distance;
     int                 size;
-    int                 max_index;
     int                 row_index;
     int                 row_count;
 } vFullScanCursor;
@@ -3113,52 +3112,49 @@ static int vFullScanCursorRowid (sqlite3_vtab_cursor *cur, sqlite_int64 *pRowid)
     return SQLITE_OK;
 }
 
-static inline int vFullScanFindMaxIndex (double *values, int n) {
-    int max_idx = 0;
-    if (n <= 32) {
-        // use simple version
-        for (int i = 1; i < n; ++i) {
-            if (values[i] > values[max_idx]) {max_idx = i;}
-        }
-        return max_idx;
+// The candidate set is a binary max-heap over (distance, rowid), kept in the parallel
+// arrays the cursor already owns. The root is the worst entry still in the set, so
+// admitting a candidate costs one comparison and O(log k) to reinsert - the previous
+// version rescanned all k slots for a new maximum on every improvement, and then paid a
+// second O(k^2) to sort. It also removes a stale-index hazard: the old max_index was
+// never reset between filters, so a cursor reused with a smaller k read past the end of
+// the reallocated array. The root of a heap is always slot zero.
+static inline void vTopKSiftDown (double *distance, int64_t *rowids, int n, int root) {
+    for (;;) {
+        int child = 2 * root + 1;
+        if (child >= n) break;
+        if (child + 1 < n && distance[child + 1] > distance[child]) ++child;
+        if (distance[child] <= distance[root]) break;
+
+        SWAP(double, distance[root], distance[child]);
+        SWAP(int64_t, rowids[root], rowids[child]);
+        root = child;
     }
-    
-    // use unrolled version
-    double max_val = values[0];
-    int i = 1;
-    
-    // unroll loop in blocks of 4
-    for (; i + 3 < n; i += 4) {
-        if (values[i] > max_val) {max_val = values[i]; max_idx = i;}
-        if (values[i + 1] > max_val) {max_val = values[i + 1]; max_idx = i + 1;}
-        if (values[i + 2] > max_val) {max_val = values[i + 2]; max_idx = i + 2;}
-        if (values[i + 3] > max_val) {max_val = values[i + 3]; max_idx = i + 3;}
-    }
-    
-    // process remaining elements
-    for (; i < n; ++i) {
-        if (values[i] > max_val) {max_val = values[i]; max_idx = i;}
-    }
-    return max_idx;
 }
 
+// evicts the worst entry in favour of a better one; callers check distance[0] first
+static inline void vTopKReplaceWorst (vFullScanCursor *c, double distance, int64_t rowid) {
+    c->distance[0] = distance;
+    c->rowids[0] = rowid;
+    vTopKSiftDown(c->distance, c->rowids, c->row_count, 0);
+}
+
+// Heapsort in place: repeatedly move the largest entry past the end of the heap, which
+// leaves the array ascending - the order the cursor emits rows in. Returns how many
+// trailing slots were never filled so the caller can trim them.
 static int vFullScanSortSlots (vFullScanCursor *c) {
-    int     counter = 0;
-    int     row_count = c->row_count;
     double  *distance = c->distance;
     int64_t *rowids = c->rowids;
-    
-    for (int i = 0; i < row_count - 1; ++i) {
-        if (distance[i] == INFINITY) ++counter;
-        for (int j = i + 1; j < row_count; ++j) {
-            if (distance[j] < distance[i]) {
-                SWAP(double, distance[i], distance[j]);
-                SWAP(int64_t, rowids[i], rowids[j]);
-            }
-        }
+    int     n = c->row_count;
+
+    for (int end = n - 1; end > 0; --end) {
+        SWAP(double, distance[0], distance[end]);
+        SWAP(int64_t, rowids[0], rowids[end]);
+        vTopKSiftDown(distance, rowids, end, 0);
     }
-    
-    if (distance[row_count-1] == INFINITY) ++counter;
+
+    int counter = 0;
+    while (counter < n && distance[n - 1 - counter] == INFINITY) ++counter;
     return counter;
 }
 
@@ -3203,11 +3199,7 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
         if (nearly_zero_float32(distance)) distance = 0.0;
         VECTOR_PRINT((void*)v2, vt, dimension);
         
-        if (distance < c->distance[c->max_index]) {
-            c->distance[c->max_index] = distance;
-            c->rowids[c->max_index] = (int64_t)sqlite3_column_int64(vm, 0);
-            c->max_index = vFullScanFindMaxIndex(c->distance, c->row_count);
-        }
+        if (distance < c->distance[0]) vTopKReplaceWorst(c, distance, (int64_t)sqlite3_column_int64(vm, 0));
     }
     
 cleanup:
@@ -3237,10 +3229,7 @@ static int vQuantRunMemory(vFullScanCursor *c, const preload_index *idx, uint8_t
         return SQLITE_CORRUPT;
     }
 
-    double *distance = c->distance;
-    int64_t *rowids = (int64_t *)c->rowids;
-    int max_index = c->max_index;
-    double current_max = distance[max_index];
+    double current_max = c->distance[0];
 
     // compute distance function
     vector_distance vd = c->table->options.v_distance;
@@ -3260,16 +3249,11 @@ static int vQuantRunMemory(vFullScanCursor *c, const preload_index *idx, uint8_t
         if (nearly_zero_float32(dist)) dist = 0.0;
         
         if (dist < current_max) {
-            distance[max_index] = dist;
-            rowids[max_index] = INT64_FROM_INT8PTR(current_data);
-
-            // Recompute max index efficiently
-            max_index = vFullScanFindMaxIndex(distance, c->row_count);
-            current_max = distance[max_index];
+            vTopKReplaceWorst(c, dist, INT64_FROM_INT8PTR(current_data));
+            current_max = c->distance[0];
         }
     }
 
-    c->max_index = max_index;
     return SQLITE_OK;
 }
 
@@ -3312,10 +3296,7 @@ static int vTurboRunPackedRows (vFullScanCursor *c, const uint8_t *data, sqlite3
         return SQLITE_CORRUPT;
     }
 
-    double *distance = c->distance;
-    int64_t *rowids = c->rowids;
-    int max_index = c->max_index;
-    double current_max = distance[max_index];
+    double current_max = c->distance[0];
 
     for (int i = 0; i < counter; ++i) {
         const uint8_t *current = data + ((size_t)i * total_stride);
@@ -3340,14 +3321,11 @@ static int vTurboRunPackedRows (vFullScanCursor *c, const uint8_t *data, sqlite3
         if (nearly_zero_float32(dist)) dist = 0.0f;
 
         if (dist < current_max) {
-            distance[max_index] = dist;
-            rowids[max_index] = INT64_FROM_INT8PTR(current);
-            max_index = vFullScanFindMaxIndex(distance, c->row_count);
-            current_max = distance[max_index];
+            vTopKReplaceWorst(c, dist, INT64_FROM_INT8PTR(current));
+            current_max = c->distance[0];
         }
     }
 
-    c->max_index = max_index;
     return SQLITE_OK;
 }
 
@@ -3508,7 +3486,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         }
         
         // cache the maximum value to avoid repeated memory accesses
-        double current_max_distance = c->distance[c->max_index];
+        double current_max_distance = c->distance[0];
         
         for (int i=0; i<counter; ++i) {
             const uint8_t *current_data = data + (i * total_stride);
@@ -3518,10 +3496,8 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
             VECTOR_PRINT((void*)vector_data, vt, dimension);
             
             if (distance < current_max_distance) {
-                c->distance[c->max_index] = distance;
-                c->rowids[c->max_index] = INT64_FROM_INT8PTR(current_data);
-                c->max_index = vFullScanFindMaxIndex(c->distance, c->row_count);
-                current_max_distance = c->distance[c->max_index]; // update cached max
+                vTopKReplaceWorst(c, distance, INT64_FROM_INT8PTR(current_data));
+                current_max_distance = c->distance[0]; // update cached max
             }
         }
     }
