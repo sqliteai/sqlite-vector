@@ -57,7 +57,14 @@ SELECT vector_backend();
 **Returns:** `TEXT`
 
 **Description:**
-Returns the active backend used by TurboQuant lookup-table scans. This is useful when validating that TurboQuant is using the expected SIMD path on a target runtime.
+Returns the SIMD tier selected at load time, the same one `vector_backend()` reports.
+
+TurboQuant lookup-table scans no longer vary by backend: the scan is one table lookup
+per row, which is already about one load per cycle on any machine, and NEON has no
+gather instruction at all. A single implementation is used everywhere, so the same query
+returns the same distance whatever the CPU — the per-backend versions this replaced
+differed by up to 1.5e-4 relative because they accumulated in `float` while the scalar
+one accumulated in `double`.
 
 **Example:**
 

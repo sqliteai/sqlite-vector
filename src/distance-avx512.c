@@ -976,51 +976,7 @@ static float bit1_distance_hamming_avx512(const void *v1, const void *v2, int n)
     return (float)distance;
 }
 
-static inline uint16_t turbo_lut3_index_avx512 (const uint8_t *packed, int row, int packed_bytes) {
-    size_t bit_pos = (size_t)row * 12u;
-    size_t byte_pos = bit_pos / 8u;
-    int shift = (int)(bit_pos % 8u);
-    uint32_t word = 0;
-    if ((int)byte_pos < packed_bytes) word |= packed[byte_pos];
-    if ((int)byte_pos + 1 < packed_bytes) word |= (uint32_t)packed[byte_pos + 1] << 8;
-    return (uint16_t)((word >> shift) & 0x0fffu);
-}
 
-float turbo_lut_dot_avx512 (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes) {
-    __m512 acc = _mm512_setzero_ps();
-    const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    int r = 0;
-    if (bits == 3) {
-        const __m512i stride = _mm512_set1_epi32(4096);
-        for (; r + 15 < lut_rows; r += 16) {
-            int idx[16];
-            for (int i = 0; i < 16; ++i) idx[i] = turbo_lut3_index_avx512(packed, r + i, packed_bytes);
-            __m512i codes = _mm512_loadu_si512((const void *)idx);
-            __m512i rows = _mm512_add_epi32(_mm512_set1_epi32(r), lane);
-            __m512i indices = _mm512_add_epi32(_mm512_mullo_epi32(rows, stride), codes);
-            __m512 vals = _mm512_i32gather_ps(indices, query_lut, 4);
-            acc = _mm512_add_ps(acc, vals);
-        }
-    } else {
-        const __m512i stride = _mm512_set1_epi32(256);
-        for (; r + 15 < lut_rows; r += 16) {
-            __m128i codes8 = _mm_loadu_si128((const __m128i *)(packed + r));
-            __m512i codes = _mm512_cvtepu8_epi32(codes8);
-            __m512i rows = _mm512_add_epi32(_mm512_set1_epi32(r), lane);
-            __m512i indices = _mm512_add_epi32(_mm512_mullo_epi32(rows, stride), codes);
-            __m512 vals = _mm512_i32gather_ps(indices, query_lut, 4);
-            acc = _mm512_add_ps(acc, vals);
-        }
-    }
-
-    float dot = _mm512_reduce_add_ps(acc);
-    if (bits == 3) {
-        for (; r < lut_rows; ++r) dot += query_lut[(size_t)r * 4096u + turbo_lut3_index_avx512(packed, r, packed_bytes)];
-    } else {
-        for (; r < lut_rows; ++r) dot += query_lut[(size_t)r * 256u + packed[r]];
-    }
-    return dot * scale;
-}
 
 #endif
 
@@ -1061,7 +1017,8 @@ bool init_distance_functions_avx512(void) {
     dispatch_distance_table[VECTOR_DISTANCE_HAMMING][VECTOR_TYPE_BIT] = bit1_distance_hamming_avx512;
 
     distance_backend_name = "AVX512";
-    turbo_lut_dot_function = turbo_lut_dot_avx512;
+    // the TurboQuant lookup scan is gather-bound and shared by every backend
+    turbo_lut_dot_function = turbo_lut_dot_cpu;
     turbo_lut_backend_name = "AVX512";
     return true;
 #else

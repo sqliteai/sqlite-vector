@@ -1305,29 +1305,13 @@ static float *turbo_build_norm_lut (const float *centroids, int bits, int dim, i
     return lut;
 }
 
-static inline uint16_t turbo_lut3_index (const uint8_t *packed, int row, int packed_bytes) {
-    size_t bit_pos = (size_t)row * 12u;
-    size_t byte_pos = bit_pos / 8u;
-    int shift = (int)(bit_pos % 8u);
-    uint32_t word = 0;
-    if ((int)byte_pos < packed_bytes) word |= packed[byte_pos];
-    if ((int)byte_pos + 1 < packed_bytes) word |= (uint32_t)packed[byte_pos + 1] << 8;
-    return (uint16_t)((word >> shift) & 0x0fffu);
-}
-
+// This used to carry a third copy of the lookup loop as a fallback for a null dispatch
+// pointer, which init_distance_functions() always sets. One implementation is also what
+// keeps every backend returning the same distance for the same query.
 static inline float turbo_dot_from_lut (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes) {
-    if (turbo_lut_dot_function) return turbo_lut_dot_function(packed, scale, query_lut, lut_rows, bits, packed_bytes);
-    double dot = 0.0;
-    if (bits == 3) {
-        for (int r = 0; r < lut_rows; ++r) {
-            dot += (double)query_lut[(size_t)r * 4096u + turbo_lut3_index(packed, r, packed_bytes)];
-        }
-    } else {
-        for (int r = 0; r < lut_rows; ++r) {
-            dot += (double)query_lut[(size_t)r * 256u + packed[r]];
-        }
-    }
-    return (float)(dot * (double)scale);
+    turbo_lut_dot_function_t fn = turbo_lut_dot_function;
+    if (!fn) fn = turbo_lut_dot_cpu;
+    return fn(packed, scale, query_lut, lut_rows, bits, packed_bytes);
 }
 
 static int table_context_ensure_turbo_plan (table_context *t_ctx, int dim) {
