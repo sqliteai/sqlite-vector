@@ -9,8 +9,15 @@
 //  Defaults to k=20 over 1,000,000 vectors of dimension 768. Override at build time:
 //      make benchmark NVECS=100000 DIM=384 K=10 NQUERIES=20
 //
-//  The database is in memory, so "on disk" below means the index is read back through
-//  SQLite rather than from the extension's preloaded buffer - not filesystem I/O.
+//  The database is a file, never :memory:. An in-memory database puts the whole index in
+//  the process regardless of configuration, which makes the memory column meaningless -
+//  the point of the streamed row is that the index is not resident.
+//
+//  Timings are best-of-N, so they are the warm case: after the first query the file is in
+//  the operating system's page cache. That cache is outside the process and is evicted
+//  under pressure, so it does not appear in the memory column - but it is why a streamed
+//  scan is not paying for storage reads here. A cold read of the whole index would add
+//  index_size / storage_bandwidth to every number below.
 //
 
 #include <math.h>
@@ -39,6 +46,18 @@ extern int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_
 #ifndef DISTANCE
 #define DISTANCE    "cosine"
 #endif
+#ifndef HARDWARE
+#define HARDWARE    ""
+#endif
+
+// The hardware table only means anything if every row measured the same thing, and the
+// overrides above make it easy to paste a row from a different workload. These are the
+// values the table is built on; a run that differs prints an explanation instead of rows.
+#define TABLE_NVECS     1000000
+#define TABLE_DIM       768
+#define TABLE_K         20
+#define TABLE_NQUERIES  20
+#define TABLE_DISTANCE  "cosine"
 
 // xorshift64*: the data must be identical from run to run and from machine to machine,
 // and rand() is neither fast enough nor portable enough for that
@@ -116,6 +135,19 @@ static sqlite3_int64 index_bytes (sqlite3 *db) {
     return bytes;
 }
 
+// 1000000 is hard to read in a table cell
+static const char *with_separators (long long n, char *buf, size_t cap) {
+    char digits[32];
+    snprintf(digits, sizeof(digits), "%lld", n);
+    size_t len = strlen(digits), out = 0;
+    for (size_t i = 0; i < len && out + 2 < cap; ++i) {
+        if (i > 0 && ((len - i) % 3) == 0) buf[out++] = ',';
+        buf[out++] = digits[i];
+    }
+    buf[out] = 0;
+    return buf;
+}
+
 static void report (const char *label, sqlite3_int64 bytes, double seconds, double recall) {
     printf("| %-24s | %8.1f | %9.2f | %9.1f | %6.1f |\n",
            label,
@@ -126,16 +158,33 @@ static void report (const char *label, sqlite3_int64 bytes, double seconds, doub
 }
 
 int main (void) {
+    const char *dbpath = "build/benchmark.db";
+    remove(dbpath);
+    remove("build/benchmark.db-journal");
+
     sqlite3 *db = NULL;
-    if (sqlite3_open(":memory:", &db) != SQLITE_OK) die(db, "open", NULL);
+    if (sqlite3_open(dbpath, &db) != SQLITE_OK) die(db, "open", NULL);
     if (sqlite3_vector_init(db, NULL, NULL) != SQLITE_OK) die(db, "vector_init", NULL);
+
+    // this database is a throwaway fixture, so skip the durability machinery while
+    // building it - it does not affect the read-only measurements below
+    run_sql(db, "PRAGMA journal_mode=OFF;");
+    run_sql(db, "PRAGMA synchronous=OFF;");
 
     sqlite3_stmt *stmt = NULL;
     sqlite3_prepare_v2(db, "SELECT vector_backend();", -1, &stmt, NULL);
     sqlite3_step(stmt);
-    printf("sqlite-vector benchmark - backend %s, SQLite %s\n", sqlite3_column_text(stmt, 0), sqlite3_libversion());
+    char backend[32];
+    snprintf(backend, sizeof(backend), "%s", (const char *)sqlite3_column_text(stmt, 0));
+    printf("sqlite-vector benchmark - backend %s, SQLite %s\n", backend, sqlite3_libversion());
     sqlite3_finalize(stmt);
     printf("%d vectors, dimension %d, %s distance, k=%d, %d queries, best of run\n", NVECS, DIM, DISTANCE, K, NQUERIES);
+    printf("file-backed database at %s, SQLite page cache left at its default\n", dbpath);
+    if (HARDWARE[0] == 0) {
+        printf("\nNOTE: HARDWARE is not set, so this run will not print rows for the README\n");
+        printf("      table. Stop now and re-run as: make benchmark HARDWARE=\"Apple M5 Pro\"\n");
+        printf("      Give the CPU only - the backend (%s here) is appended automatically.\n", backend);
+    }
     printf("data is uniform random, which is the worst case for quantization recall:\n");
     printf("real embeddings have structure that the quantizers exploit\n\n");
 
@@ -172,13 +221,19 @@ int main (void) {
     double exact_time = measure(db, "vector_full_scan", NULL, NULL);
     report("FLOAT32 exact", 0, exact_time, 100.0);
 
+    // max_memory bounds the chunk the scan streams through when the index is not
+    // preloaded, and is the whole point of that configuration: the index here is 740 MB,
+    // the scan walks it 30 MB at a time
     struct { const char *opts; const char *label; } modes[] = {
-        { "qtype=UINT8",           "UINT8" },
-        { "qtype=INT8",            "INT8" },
-        { "qtype=1BIT",            "1BIT" },
-        { "qtype=TURBO,qbits=2",   "TURBO2" },
-        { "qtype=TURBO,qbits=4",   "TURBO4" },
+        { "qtype=UINT8,max_memory=30MB",         "UINT8" },
+        { "qtype=INT8,max_memory=30MB",          "INT8" },
+        { "qtype=1BIT,max_memory=30MB",          "1BIT" },
+        { "qtype=TURBO,qbits=2,max_memory=30MB", "TURBO2" },
+        { "qtype=TURBO,qbits=4,max_memory=30MB", "TURBO4" },
     };
+
+    double int8_stream_ms = 0, int8_pre_ms = 0, int8_recall = 0;
+    sqlite3_int64 int8_bytes = 0, int8_stream_mem = 0, int8_pre_mem = 0;
 
     for (unsigned m = 0; m < sizeof(modes) / sizeof(modes[0]); ++m) {
         char sql[160], label[64];
@@ -188,18 +243,70 @@ int main (void) {
         sqlite3_int64 bytes = index_bytes(db);
 
         double recall = 0.0;
+        sqlite3_int64 before = sqlite3_memory_used();
+        sqlite3_memory_highwater(1);
         double t = measure(db, "vector_quantize_scan", exact, &recall);
-        snprintf(label, sizeof(label), "%s", modes[m].label);
+        sqlite3_int64 stream_peak = sqlite3_memory_highwater(0) - before;
+        snprintf(label, sizeof(label), "%s (30 MB)", modes[m].label);
         report(label, bytes, t, recall);
+        if (strcmp(modes[m].label, "INT8") == 0) { int8_stream_ms = t; int8_stream_mem = stream_peak; }
 
+        before = sqlite3_memory_used();
         run_sql(db, "SELECT vector_quantize_preload('t','v');");
+        sqlite3_int64 preload_held = sqlite3_memory_used() - before;
         t = measure(db, "vector_quantize_scan", exact, &recall);
         snprintf(label, sizeof(label), "%s preloaded", modes[m].label);
         report(label, bytes, t, recall);
 
+        if (strcmp(modes[m].label, "INT8") == 0) {
+            int8_bytes = bytes;
+            int8_recall = recall;
+            int8_pre_ms = t;
+            int8_pre_mem = preload_held;
+        }
+
         run_sql(db, "SELECT vector_quantize_cleanup('t','v');");
     }
 
+    // The README table compares hardware, so it carries the two configurations that
+    // differ by deployment rather than by accuracy: the whole index in RAM, and the same
+    // index streamed in 30 MB. Everything else about INT8 is a property of the data.
+    printf("\n");
+    int canonical = (NVECS == TABLE_NVECS) && (DIM == TABLE_DIM) && (K == TABLE_K) &&
+                    (NQUERIES == TABLE_NQUERIES) && (strcmp(DISTANCE, TABLE_DISTANCE) == 0);
+    if (!canonical) {
+        printf("These parameters are not the ones the README hardware table is built on, so\n");
+        printf("no rows are printed - a row measured on a different workload would sit in that\n");
+        printf("table looking comparable without being comparable.\n\n");
+        printf("  this run   NVECS=%d DIM=%d K=%d NQUERIES=%d DISTANCE=%s\n", NVECS, DIM, K, NQUERIES, DISTANCE);
+        printf("  the table  NVECS=%d DIM=%d K=%d NQUERIES=%d DISTANCE=%s\n\n",
+               TABLE_NVECS, TABLE_DIM, TABLE_K, TABLE_NQUERIES, TABLE_DISTANCE);
+        printf("For the table, run: make benchmark HARDWARE=\"<your CPU>\"\n");
+        sqlite3_close(db);
+        remove(dbpath);
+        return 0;
+    }
+    if (HARDWARE[0] == 0) {
+        printf("No rows printed: HARDWARE was not set. Re-run as\n\n");
+        printf("  make benchmark HARDWARE=\"Apple M5 Pro\"\n");
+        sqlite3_close(db);
+        remove(dbpath);
+        return 0;
+    }
+
+    char nbuf[32];
+    with_separators(NVECS, nbuf, sizeof(nbuf));
+    printf("Paste these two rows into the hardware table in README.md:\n\n");
+    printf("| %s - %s | %s | `INT8` preloaded | %.0f MB | %.1f | %.1f | %.1f%% |\n",
+           HARDWARE, backend, nbuf, (double)int8_pre_mem / (1024.0 * 1024.0),
+           int8_pre_ms * 1000.0, NVECS / int8_pre_ms / 1e6, int8_recall);
+    printf("| %s - %s | %s | `INT8` streamed | %.0f MB | %.1f | %.1f | %.1f%% |\n",
+           HARDWARE, backend, nbuf, (double)int8_stream_mem / (1024.0 * 1024.0),
+           int8_stream_ms * 1000.0, NVECS / int8_stream_ms / 1e6, int8_recall);
+    printf("\nreference for this machine: FLOAT32 exact %.1f ms/query, index on disk %.0f MB\n",
+           exact_time * 1000.0, (double)int8_bytes / (1024.0 * 1024.0));
+
     sqlite3_close(db);
+    remove(dbpath);
     return 0;
 }

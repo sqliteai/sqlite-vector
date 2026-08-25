@@ -147,67 +147,108 @@ SELECT e.id, v.distance FROM images AS e
 
 ## Benchmark
 
-Every number below comes from one command, so you can reproduce it and compare machines:
+To add your machine to the table, one command — pass the CPU name and nothing else:
 
 ```bash
-make benchmark
+make benchmark HARDWARE="Apple M5 Pro"
 ```
 
-That builds `test/benchmark.c` at `-O3` with the same per-translation-unit SIMD flags the
-shipped extension uses, then searches **k=20 over 1,000,000 vectors of dimension 768**
-with cosine distance, 20 queries, reporting the best. Recall is the overlap with the exact
-full-precision top-20. Override any of it:
+It builds `test/benchmark.c` at `-O3` with the same per-translation-unit SIMD flags the
+shipped extension uses, runs **k=20 over 1,000,000 vectors of dimension 768** with cosine
+distance and 20 queries reporting the best, and prints two rows ready to paste, unedited,
+into the table below.
+
+Two things it does so a pasted row cannot be wrong. The backend is **appended by the
+binary** from what the build actually selected, not typed by hand, so a row cannot claim
+`AVX512` on a build that fell back to `SSE2`. And a run whose parameters differ from the
+ones the table is built on **prints an explanation instead of rows**, because a row
+measured on a different workload would sit in that table looking comparable without being
+comparable.
+
+That second guard exists because the parameters *are* adjustable, just not for this table:
 
 ```bash
 make benchmark NVECS=100000 DIM=384 K=10 DISTANCE=l2
 ```
 
-### Apple M5 Pro (6P+12E, 64 GB, macOS 26.6.2) — NEON backend
+That run prints the mode table for whatever you asked for, and no paste-ready rows.
 
-| Mode | Index | ms/query | Mvec/s | Recall@20 |
+Common to every row: the database is **a file, never `:memory:`** — an in-memory database
+puts the whole index in the process no matter how it is configured, which makes any memory
+figure meaningless. Vectors are uniform random with a fixed seed, so two machines measure
+the same data. The `INT8` index is **740 MB** on disk against 2930 MB of raw `FLOAT32`.
+Recall is the overlap with the exact `FLOAT32` scan, the baseline everything is compared
+against, 100% by definition; on the reference machine that scan takes **484 ms/query**,
+because it reads 3 GB per query.
+
+The two rows per machine are the two ways the same index gets deployed. *Preloaded* holds
+it in the process after `vector_quantize_preload()`. *Streamed* walks it through a bounded
+buffer set by `max_memory=30MB`, the default, and what a device with less RAM than the
+index actually does. **Max memory** is measured, not the parameter echoed back: it is the
+peak the extension and SQLite had allocated during the scan.
+
+### Hardware
+
+| Hardware | Vectors | Index | Max memory | ms/query | Mvec/s | Recall@20 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Apple M5 Pro - NEON | 1,000,000 | `INT8` preloaded | 740 MB | 37.6 | 26.6 | 99.5% |
+| Apple M5 Pro - NEON | 1,000,000 | `INT8` streamed | 30 MB | 114.4 | 8.7 | 99.5% |
+
+*Results from other CPUs welcome — run the command above and open a PR adding the two rows
+it prints.*
+
+The trade is **25x less memory for 3x the latency**, with recall untouched: both rows read
+the same index, only how much of it is resident differs.
+
+Two things the timings do not show. They are best-of-20, so the file is in the operating
+system's page cache by then — that cache lives outside the process and is evicted under
+pressure, so it is not in the memory column, but it is why the streamed row is not paying
+for storage reads. On a device where the index genuinely does not fit in RAM, add
+`index size / storage bandwidth` to the streamed number. And the preloaded row is almost
+unaffected by where the database lives, because after the one-time preload the scan reads
+the extension's own buffer and never goes back to SQLite.
+
+Recall is repeated on every row on purpose: it depends on the data, not the hardware, so a
+row that disagrees with the others is a sign that machine selected a different SIMD
+backend than it should have.
+
+### Choosing a mode
+
+`INT8` is in the table above because it is the mode to reach for first. The others, same
+machine, same data, all preloaded:
+
+| Mode | Index | ms/query | vs exact | Recall@20 |
 | --- | ---: | ---: | ---: | ---: |
-| `FLOAT32` exact | 2930 MB | 147.8 | 6.8 | 100.0% |
-| `UINT8` | 740 MB | 55.4 | 18.0 | 33.8% |
-| `UINT8` preloaded | 740 MB | 37.2 | 26.9 | 33.8% |
-| `INT8` | 740 MB | 56.4 | 17.7 | 99.5% |
-| **`INT8` preloaded** | **740 MB** | **37.7** | **26.5** | **99.5%** |
-| `1BIT` | 99 MB | 5.3 | 187.5 | 10.0% |
-| `1BIT` preloaded | 99 MB | 2.7 | 377.6 | 10.0% |
-| `TURBO2` | 195 MB | 53.0 | 18.9 | 45.2% |
-| `TURBO2` preloaded | 195 MB | 48.2 | 20.7 | 45.2% |
-| `TURBO4` | 378 MB | 160.4 | 6.2 | 81.8% |
-| `TURBO4` preloaded | 378 MB | 151.8 | 6.6 | 81.8% |
+| `FLOAT32` exact | 2930 MB | 484.4 | 1.0x | 100.0% |
+| `UINT8` | 740 MB | 37.3 | 13.0x | 33.8% |
+| `INT8` | 740 MB | 37.6 | 12.9x | 99.5% |
+| `1BIT` | 99 MB | 2.5 | 195x | 10.0% |
+| `TURBO2` | 195 MB | 48.0 | 10.1x | 45.2% |
+| `TURBO4` | 378 MB | 151.5 | 3.2x | 81.8% |
 
-*Contributions from other CPUs welcome — run the command above and open a PR adding a
-section.*
+**The data is uniform random**, the worst case for every quantizer: real embeddings have
+structure quantization exploits, so recall on your own vectors will be higher, often much
+higher. Read that column as a floor and a way to rank the modes, not as a prediction.
 
-### Reading the table
+Three things are worth knowing before choosing.
 
-**The data is uniform random**, which is the worst case for every quantizer: real
-embeddings have structure that quantization exploits, so recall on your own vectors will
-be higher, often much higher. Treat the recall column as a floor and a way to rank the
-modes against each other, not as a prediction for your dataset.
-
-Three things are worth knowing before you pick a mode.
-
-**For cosine, use `INT8`, not `UINT8`.** They cost exactly the same and store exactly the
-same number of bytes, but `UINT8` recall collapses to 33.8% while `INT8` holds 99.5%.
+**For cosine, use `INT8`, not `UINT8`.** Same size, same speed, 33.8% recall against 99.5%.
 Unsigned quantization subtracts the dataset minimum before scaling, and cosine measures
-angle, which that shift destroys. `UINT8` is the right choice for L2, where a common
-translation cancels out. If you do not set `qtype`, the extension picks `UINT8` for
-non-negative data and `INT8` otherwise — which is the correct call for L2 and the wrong
-one for cosine, so set it explicitly when you use cosine.
+angle, which that shift destroys. `UINT8` is right for L2, where a common translation
+cancels. If you omit `qtype` the extension picks `UINT8` for non-negative data — correct
+for L2, wrong for cosine — so set it explicitly when you use cosine.
 
-**`1BIT` is a filter, not an answer.** 377 Mvec/s and 30x less memory, at 10% recall on
-this data. It earns its place as a first pass whose survivors you re-rank at full
-precision, not as the final ranking.
+**`1BIT` is a filter, not an answer.** 195x faster than exact and 30x smaller, at 10%
+recall here. It earns its place as a first pass whose survivors you re-rank at full
+precision.
 
-**TurboQuant trades speed for size, not for speed.** `TURBO4` here is *slower* than the
-exact scan (160 ms against 148 ms) while using 8x less memory and returning 81.8% recall.
-The lookup-table scan is one table gather per row, and at dimension 768 that is 384
-gathers into a 393 KB table for every vector — already about one lookup per cycle, so
-there is no headroom left in the current storage layout. Choose TurboQuant when the
-memory budget is what binds; choose `INT8` when throughput is.
+**TurboQuant buys memory against `INT8`, not speed.** `TURBO4` is 3.2x faster than the
+exact scan, so it is a real win over brute force — but `INT8` is 4x faster again at twice
+the size, and `TURBO2` is both smaller and faster than `TURBO4` if 45% recall is enough.
+TurboQuant's lookup scan is one table gather per row: at dimension 768 that is 384 gathers
+into a 384 KB table per vector, already about one lookup per cycle, so its current storage
+layout has no headroom left ([#57](https://github.com/sqliteai/sqlite-vector/issues/57)).
+Reach for it when the memory budget is what binds.
 
 ## TurboQuant Benchmark and Recall
 
@@ -221,15 +262,13 @@ SELECT vector_quantize('images', 'embedding', 'qtype=TURBO,qbits=4');
 SELECT vector_quantize('images', 'embedding', 'qtype=TURBO2');
 ```
 
-An earlier synthetic benchmark reported speedups of 15x for 4-bit and 38x for 2-bit
-against `vector_full_scan()`. Those numbers were measured with a **file-backed** database,
-where the full scan reads 3 GB of raw vectors off disk and the comparison is dominated by
-I/O rather than by arithmetic — and before the distance kernels were rewritten, which made
-the full-precision scan itself substantially faster. Against an in-memory baseline on
-current code the picture is different: see [Benchmark](#benchmark) below, where `TURBO4`
-is marginally slower than the exact scan and its argument is memory, not speed. Both
-measurements are real; they answer different questions. If your working set does not fit
-in RAM, the file-backed comparison is the one that describes your deployment.
+An earlier synthetic benchmark on this dataset reported speedups of 15x for 4-bit and 38x
+for 2-bit against `vector_full_scan()`, with DOT distance and k=10. The [Benchmark](#benchmark)
+section above measures the same shape with cosine and k=20 and lands lower — 3.2x for
+4-bit, 10.2x for 2-bit — mostly because the distance kernels have since been rewritten,
+which made the full-precision baseline it is compared against substantially faster. The
+direction is the same: TurboQuant beats brute force, and `INT8` beats TurboQuant on speed
+while costing twice the memory.
 
 For comparison, the raw `FLOAT32` vectors alone are about **3.07 GB** for 1M x 768 before SQLite row/page overhead. TurboQuant 4-bit reduces the scan representation to about **13%** of that raw vector payload, TurboQuant 3-bit to about **10%**, and TurboQuant 2-bit to about **7%**. Actual resident memory depends on whether the database is in-memory or file-backed, SQLite cache settings, preloading, page cache behavior, and the host allocator.
 
