@@ -47,8 +47,17 @@ extern int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_
 #define DISTANCE    "cosine"
 #endif
 #ifndef HARDWARE
-#define HARDWARE    "<CPU> — <backend> backend"
+#define HARDWARE    ""
 #endif
+
+// The hardware table only means anything if every row measured the same thing, and the
+// overrides above make it easy to paste a row from a different workload. These are the
+// values the table is built on; a run that differs prints an explanation instead of rows.
+#define TABLE_NVECS     1000000
+#define TABLE_DIM       768
+#define TABLE_K         20
+#define TABLE_NQUERIES  20
+#define TABLE_DISTANCE  "cosine"
 
 // xorshift64*: the data must be identical from run to run and from machine to machine,
 // and rand() is neither fast enough nor portable enough for that
@@ -165,10 +174,17 @@ int main (void) {
     sqlite3_stmt *stmt = NULL;
     sqlite3_prepare_v2(db, "SELECT vector_backend();", -1, &stmt, NULL);
     sqlite3_step(stmt);
-    printf("sqlite-vector benchmark - backend %s, SQLite %s\n", sqlite3_column_text(stmt, 0), sqlite3_libversion());
+    char backend[32];
+    snprintf(backend, sizeof(backend), "%s", (const char *)sqlite3_column_text(stmt, 0));
+    printf("sqlite-vector benchmark - backend %s, SQLite %s\n", backend, sqlite3_libversion());
     sqlite3_finalize(stmt);
     printf("%d vectors, dimension %d, %s distance, k=%d, %d queries, best of run\n", NVECS, DIM, DISTANCE, K, NQUERIES);
     printf("file-backed database at %s, SQLite page cache left at its default\n", dbpath);
+    if (HARDWARE[0] == 0) {
+        printf("\nNOTE: HARDWARE is not set, so this run will not print rows for the README\n");
+        printf("      table. Stop now and re-run as: make benchmark HARDWARE=\"Apple M5 Pro\"\n");
+        printf("      Give the CPU only - the backend (%s here) is appended automatically.\n", backend);
+    }
     printf("data is uniform random, which is the worst case for quantization recall:\n");
     printf("real embeddings have structure that the quantizers exploit\n\n");
 
@@ -255,14 +271,37 @@ int main (void) {
     // The README table compares hardware, so it carries the two configurations that
     // differ by deployment rather than by accuracy: the whole index in RAM, and the same
     // index streamed in 30 MB. Everything else about INT8 is a property of the data.
+    printf("\n");
+    int canonical = (NVECS == TABLE_NVECS) && (DIM == TABLE_DIM) && (K == TABLE_K) &&
+                    (NQUERIES == TABLE_NQUERIES) && (strcmp(DISTANCE, TABLE_DISTANCE) == 0);
+    if (!canonical) {
+        printf("These parameters are not the ones the README hardware table is built on, so\n");
+        printf("no rows are printed - a row measured on a different workload would sit in that\n");
+        printf("table looking comparable without being comparable.\n\n");
+        printf("  this run   NVECS=%d DIM=%d K=%d NQUERIES=%d DISTANCE=%s\n", NVECS, DIM, K, NQUERIES, DISTANCE);
+        printf("  the table  NVECS=%d DIM=%d K=%d NQUERIES=%d DISTANCE=%s\n\n",
+               TABLE_NVECS, TABLE_DIM, TABLE_K, TABLE_NQUERIES, TABLE_DISTANCE);
+        printf("For the table, run: make benchmark HARDWARE=\"<your CPU>\"\n");
+        sqlite3_close(db);
+        remove(dbpath);
+        return 0;
+    }
+    if (HARDWARE[0] == 0) {
+        printf("No rows printed: HARDWARE was not set. Re-run as\n\n");
+        printf("  make benchmark HARDWARE=\"Apple M5 Pro\"\n");
+        sqlite3_close(db);
+        remove(dbpath);
+        return 0;
+    }
+
     char nbuf[32];
     with_separators(NVECS, nbuf, sizeof(nbuf));
-    printf("\n\nPaste these two rows into the hardware table in README.md:\n\n");
-    printf("| %s | %s | `INT8` preloaded | %.0f MB | %.1f | %.1f | %.1f%% |\n",
-           HARDWARE, nbuf, (double)int8_pre_mem / (1024.0 * 1024.0),
+    printf("Paste these two rows into the hardware table in README.md:\n\n");
+    printf("| %s - %s | %s | `INT8` preloaded | %.0f MB | %.1f | %.1f | %.1f%% |\n",
+           HARDWARE, backend, nbuf, (double)int8_pre_mem / (1024.0 * 1024.0),
            int8_pre_ms * 1000.0, NVECS / int8_pre_ms / 1e6, int8_recall);
-    printf("| %s | %s | `INT8` streamed | %.0f MB | %.1f | %.1f | %.1f%% |\n",
-           HARDWARE, nbuf, (double)int8_stream_mem / (1024.0 * 1024.0),
+    printf("| %s - %s | %s | `INT8` streamed | %.0f MB | %.1f | %.1f | %.1f%% |\n",
+           HARDWARE, backend, nbuf, (double)int8_stream_mem / (1024.0 * 1024.0),
            int8_stream_ms * 1000.0, NVECS / int8_stream_ms / 1e6, int8_recall);
     printf("\nreference for this machine: FLOAT32 exact %.1f ms/query, index on disk %.0f MB\n",
            exact_time * 1000.0, (double)int8_bytes / (1024.0 * 1024.0));

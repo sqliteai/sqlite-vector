@@ -147,27 +147,38 @@ SELECT e.id, v.distance FROM images AS e
 
 ## Benchmark
 
-One command, so results from different machines are comparable:
+To add your machine to the table, one command — pass the CPU name and nothing else:
 
 ```bash
-make benchmark HARDWARE="Apple M5 Pro - NEON"
+make benchmark HARDWARE="Apple M5 Pro"
 ```
 
 It builds `test/benchmark.c` at `-O3` with the same per-translation-unit SIMD flags the
-shipped extension uses, then runs **k=20 over 1,000,000 vectors of dimension 768** with
-cosine distance, 20 queries, reporting the best. It prints the two rows below ready to
-paste. Override anything:
+shipped extension uses, runs **k=20 over 1,000,000 vectors of dimension 768** with cosine
+distance and 20 queries reporting the best, and prints two rows ready to paste, unedited,
+into the table below.
+
+Two things it does so a pasted row cannot be wrong. The backend is **appended by the
+binary** from what the build actually selected, not typed by hand, so a row cannot claim
+`AVX512` on a build that fell back to `SSE2`. And a run whose parameters differ from the
+ones the table is built on **prints an explanation instead of rows**, because a row
+measured on a different workload would sit in that table looking comparable without being
+comparable.
+
+That second guard exists because the parameters *are* adjustable, just not for this table:
 
 ```bash
 make benchmark NVECS=100000 DIM=384 K=10 DISTANCE=l2
 ```
+
+That run prints the mode table for whatever you asked for, and no paste-ready rows.
 
 Common to every row: the database is **a file, never `:memory:`** — an in-memory database
 puts the whole index in the process no matter how it is configured, which makes any memory
 figure meaningless. Vectors are uniform random with a fixed seed, so two machines measure
 the same data. The `INT8` index is **740 MB** on disk against 2930 MB of raw `FLOAT32`.
 Recall is the overlap with the exact `FLOAT32` scan, the baseline everything is compared
-against, 100% by definition; on the reference machine that scan takes **486 ms/query**,
+against, 100% by definition; on the reference machine that scan takes **484 ms/query**,
 because it reads 3 GB per query.
 
 The two rows per machine are the two ways the same index gets deployed. *Preloaded* holds
@@ -181,10 +192,10 @@ peak the extension and SQLite had allocated during the scan.
 | Hardware | Vectors | Index | Max memory | ms/query | Mvec/s | Recall@20 |
 | --- | ---: | --- | ---: | ---: | ---: | ---: |
 | Apple M5 Pro - NEON | 1,000,000 | `INT8` preloaded | 740 MB | 37.6 | 26.6 | 99.5% |
-| Apple M5 Pro - NEON | 1,000,000 | `INT8` streamed | 30 MB | 115.5 | 8.7 | 99.5% |
+| Apple M5 Pro - NEON | 1,000,000 | `INT8` streamed | 30 MB | 114.4 | 8.7 | 99.5% |
 
-*Results from other CPUs welcome — run the command above and open a PR adding your two
-rows.*
+*Results from other CPUs welcome — run the command above and open a PR adding the two rows
+it prints.*
 
 The trade is **25x less memory for 3x the latency**, with recall untouched: both rows read
 the same index, only how much of it is resident differs.
@@ -208,12 +219,12 @@ machine, same data, all preloaded:
 
 | Mode | Index | ms/query | vs exact | Recall@20 |
 | --- | ---: | ---: | ---: | ---: |
-| `FLOAT32` exact | 2930 MB | 486.5 | 1.0x | 100.0% |
-| `UINT8` | 740 MB | 37.5 | 13.0x | 33.8% |
-| `INT8` | 740 MB | 37.6 | 13.0x | 99.5% |
-| `1BIT` | 99 MB | 2.7 | 183x | 10.0% |
-| `TURBO2` | 195 MB | 47.8 | 10.2x | 45.2% |
-| `TURBO4` | 378 MB | 150.9 | 3.2x | 81.8% |
+| `FLOAT32` exact | 2930 MB | 484.4 | 1.0x | 100.0% |
+| `UINT8` | 740 MB | 37.3 | 13.0x | 33.8% |
+| `INT8` | 740 MB | 37.6 | 12.9x | 99.5% |
+| `1BIT` | 99 MB | 2.5 | 195x | 10.0% |
+| `TURBO2` | 195 MB | 48.0 | 10.1x | 45.2% |
+| `TURBO4` | 378 MB | 151.5 | 3.2x | 81.8% |
 
 **The data is uniform random**, the worst case for every quantizer: real embeddings have
 structure quantization exploits, so recall on your own vectors will be higher, often much
@@ -227,7 +238,7 @@ angle, which that shift destroys. `UINT8` is right for L2, where a common transl
 cancels. If you omit `qtype` the extension picks `UINT8` for non-negative data — correct
 for L2, wrong for cosine — so set it explicitly when you use cosine.
 
-**`1BIT` is a filter, not an answer.** 183x faster than exact and 30x smaller, at 10%
+**`1BIT` is a filter, not an answer.** 195x faster than exact and 30x smaller, at 10%
 recall here. It earns its place as a first pass whose survivors you re-rank at full
 precision.
 
