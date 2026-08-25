@@ -9,8 +9,15 @@
 //  Defaults to k=20 over 1,000,000 vectors of dimension 768. Override at build time:
 //      make benchmark NVECS=100000 DIM=384 K=10 NQUERIES=20
 //
-//  The database is in memory, so "on disk" below means the index is read back through
-//  SQLite rather than from the extension's preloaded buffer - not filesystem I/O.
+//  The database is a file, never :memory:. An in-memory database puts the whole index in
+//  the process regardless of configuration, which makes the memory column meaningless -
+//  the point of the streamed row is that the index is not resident.
+//
+//  Timings are best-of-N, so they are the warm case: after the first query the file is in
+//  the operating system's page cache. That cache is outside the process and is evicted
+//  under pressure, so it does not appear in the memory column - but it is why a streamed
+//  scan is not paying for storage reads here. A cold read of the whole index would add
+//  index_size / storage_bandwidth to every number below.
 //
 
 #include <math.h>
@@ -142,9 +149,18 @@ static void report (const char *label, sqlite3_int64 bytes, double seconds, doub
 }
 
 int main (void) {
+    const char *dbpath = "build/benchmark.db";
+    remove(dbpath);
+    remove("build/benchmark.db-journal");
+
     sqlite3 *db = NULL;
-    if (sqlite3_open(":memory:", &db) != SQLITE_OK) die(db, "open", NULL);
+    if (sqlite3_open(dbpath, &db) != SQLITE_OK) die(db, "open", NULL);
     if (sqlite3_vector_init(db, NULL, NULL) != SQLITE_OK) die(db, "vector_init", NULL);
+
+    // this database is a throwaway fixture, so skip the durability machinery while
+    // building it - it does not affect the read-only measurements below
+    run_sql(db, "PRAGMA journal_mode=OFF;");
+    run_sql(db, "PRAGMA synchronous=OFF;");
 
     sqlite3_stmt *stmt = NULL;
     sqlite3_prepare_v2(db, "SELECT vector_backend();", -1, &stmt, NULL);
@@ -152,6 +168,7 @@ int main (void) {
     printf("sqlite-vector benchmark - backend %s, SQLite %s\n", sqlite3_column_text(stmt, 0), sqlite3_libversion());
     sqlite3_finalize(stmt);
     printf("%d vectors, dimension %d, %s distance, k=%d, %d queries, best of run\n", NVECS, DIM, DISTANCE, K, NQUERIES);
+    printf("file-backed database at %s, SQLite page cache left at its default\n", dbpath);
     printf("data is uniform random, which is the worst case for quantization recall:\n");
     printf("real embeddings have structure that the quantizers exploit\n\n");
 
@@ -251,5 +268,6 @@ int main (void) {
            exact_time * 1000.0, (double)int8_bytes / (1024.0 * 1024.0));
 
     sqlite3_close(db);
+    remove(dbpath);
     return 0;
 }
