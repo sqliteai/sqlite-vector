@@ -188,11 +188,14 @@ unittest-simd: $(BUILD_DIR)/backend $(BUILD_DIR)/test_vector_simd
 #   make benchmark                                    k=20 over 1M vectors of dim 768
 #   make benchmark NVECS=100000 DIM=384 K=10          smaller, for a quick look
 #   make benchmark DISTANCE=l2                        a different metric
+#   make benchmark HARDWARE="M5 Pro - NEON"           label the row it prints for the README
 NVECS ?= 1000000
 DIM ?= 768
 K ?= 20
 NQUERIES ?= 20
 DISTANCE ?= cosine
+# names the row this run contributes to the README hardware table
+HARDWARE ?= <CPU> - <backend> backend
 
 BENCH_OBJ = $(patsubst %.c, $(BUILD_DIR)/bm-%.o, $(notdir $(SRC_FILES))) $(BUILD_DIR)/bm-sqlite3.o
 
@@ -203,7 +206,7 @@ $(BUILD_DIR)/bm-%.o: %.c
 	$(CC) $(CFLAGS) $(ISA_CFLAGS) -DSQLITE_CORE -O3 -c $< -o $@
 
 $(BUILD_DIR)/benchmark: test/benchmark.c $(BENCH_OBJ)
-	$(CC) $(CFLAGS) -DSQLITE_CORE -O3 -DNVECS=$(NVECS) -DDIM=$(DIM) -DK=$(K) -DNQUERIES=$(NQUERIES) -DDISTANCE='"$(DISTANCE)"' $< $(BENCH_OBJ) -o $@ -lm -lpthread
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O3 -DNVECS=$(NVECS) -DDIM=$(DIM) -DK=$(K) -DNQUERIES=$(NQUERIES) -DDISTANCE='"$(DISTANCE)"' -DHARDWARE='"$(HARDWARE)"' $< $(BENCH_OBJ) -o $@ -lm -lpthread
 
 benchmark: $(BUILD_DIR)/benchmark
 	./$(BUILD_DIR)/benchmark

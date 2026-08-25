@@ -39,6 +39,9 @@ extern int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_
 #ifndef DISTANCE
 #define DISTANCE    "cosine"
 #endif
+#ifndef HARDWARE
+#define HARDWARE    "<CPU> — <backend> backend"
+#endif
 
 // xorshift64*: the data must be identical from run to run and from machine to machine,
 // and rand() is neither fast enough nor portable enough for that
@@ -116,6 +119,19 @@ static sqlite3_int64 index_bytes (sqlite3 *db) {
     return bytes;
 }
 
+// 1000000 is hard to read in a table cell
+static const char *with_separators (long long n, char *buf, size_t cap) {
+    char digits[32];
+    snprintf(digits, sizeof(digits), "%lld", n);
+    size_t len = strlen(digits), out = 0;
+    for (size_t i = 0; i < len && out + 2 < cap; ++i) {
+        if (i > 0 && ((len - i) % 3) == 0) buf[out++] = ',';
+        buf[out++] = digits[i];
+    }
+    buf[out] = 0;
+    return buf;
+}
+
 static void report (const char *label, sqlite3_int64 bytes, double seconds, double recall) {
     printf("| %-24s | %8.1f | %9.2f | %9.1f | %6.1f |\n",
            label,
@@ -172,13 +188,19 @@ int main (void) {
     double exact_time = measure(db, "vector_full_scan", NULL, NULL);
     report("FLOAT32 exact", 0, exact_time, 100.0);
 
+    // max_memory bounds the chunk the scan streams through when the index is not
+    // preloaded, and is the whole point of that configuration: the index here is 740 MB,
+    // the scan walks it 30 MB at a time
     struct { const char *opts; const char *label; } modes[] = {
-        { "qtype=UINT8",           "UINT8" },
-        { "qtype=INT8",            "INT8" },
-        { "qtype=1BIT",            "1BIT" },
-        { "qtype=TURBO,qbits=2",   "TURBO2" },
-        { "qtype=TURBO,qbits=4",   "TURBO4" },
+        { "qtype=UINT8,max_memory=30MB",         "UINT8" },
+        { "qtype=INT8,max_memory=30MB",          "INT8" },
+        { "qtype=1BIT,max_memory=30MB",          "1BIT" },
+        { "qtype=TURBO,qbits=2,max_memory=30MB", "TURBO2" },
+        { "qtype=TURBO,qbits=4,max_memory=30MB", "TURBO4" },
     };
+
+    double int8_stream_ms = 0, int8_pre_ms = 0, int8_recall = 0;
+    sqlite3_int64 int8_bytes = 0, int8_stream_mem = 0, int8_pre_mem = 0;
 
     for (unsigned m = 0; m < sizeof(modes) / sizeof(modes[0]); ++m) {
         char sql[160], label[64];
@@ -188,17 +210,45 @@ int main (void) {
         sqlite3_int64 bytes = index_bytes(db);
 
         double recall = 0.0;
+        sqlite3_int64 before = sqlite3_memory_used();
+        sqlite3_memory_highwater(1);
         double t = measure(db, "vector_quantize_scan", exact, &recall);
-        snprintf(label, sizeof(label), "%s", modes[m].label);
+        sqlite3_int64 stream_peak = sqlite3_memory_highwater(0) - before;
+        snprintf(label, sizeof(label), "%s (30 MB)", modes[m].label);
         report(label, bytes, t, recall);
+        if (strcmp(modes[m].label, "INT8") == 0) { int8_stream_ms = t; int8_stream_mem = stream_peak; }
 
+        before = sqlite3_memory_used();
         run_sql(db, "SELECT vector_quantize_preload('t','v');");
+        sqlite3_int64 preload_held = sqlite3_memory_used() - before;
         t = measure(db, "vector_quantize_scan", exact, &recall);
         snprintf(label, sizeof(label), "%s preloaded", modes[m].label);
         report(label, bytes, t, recall);
 
+        if (strcmp(modes[m].label, "INT8") == 0) {
+            int8_bytes = bytes;
+            int8_recall = recall;
+            int8_pre_ms = t;
+            int8_pre_mem = preload_held;
+        }
+
         run_sql(db, "SELECT vector_quantize_cleanup('t','v');");
     }
+
+    // The README table compares hardware, so it carries the two configurations that
+    // differ by deployment rather than by accuracy: the whole index in RAM, and the same
+    // index streamed in 30 MB. Everything else about INT8 is a property of the data.
+    char nbuf[32];
+    with_separators(NVECS, nbuf, sizeof(nbuf));
+    printf("\n\nPaste these two rows into the hardware table in README.md:\n\n");
+    printf("| %s | %s | `INT8` preloaded | %.0f MB | %.1f | %.1f | %.1f%% |\n",
+           HARDWARE, nbuf, (double)int8_pre_mem / (1024.0 * 1024.0),
+           int8_pre_ms * 1000.0, NVECS / int8_pre_ms / 1e6, int8_recall);
+    printf("| %s | %s | `INT8` streamed | %.0f MB | %.1f | %.1f | %.1f%% |\n",
+           HARDWARE, nbuf, (double)int8_stream_mem / (1024.0 * 1024.0),
+           int8_stream_ms * 1000.0, NVECS / int8_stream_ms / 1e6, int8_recall);
+    printf("\nreference for this machine: FLOAT32 exact %.1f ms/query, index on disk %.0f MB\n",
+           exact_time * 1000.0, (double)int8_bytes / (1024.0 * 1024.0));
 
     sqlite3_close(db);
     return 0;
