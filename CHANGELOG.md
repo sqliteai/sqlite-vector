@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+Documentation and tooling only — the extension itself is unchanged from 1.1.0, so a build
+from this revision produces the same binaries.
+
+### Changed
+
+- **`make benchmark` now uses a file-backed database, never `:memory:`.** An in-memory
+  database keeps the whole index in the process however the scan is configured, which made
+  the memory figures meaningless: the point of a streamed scan is that the index is *not*
+  resident. Reported figures move accordingly — the exact `FLOAT32` scan goes from 148 to
+  484 ms/query because it now pays to read 3 GB, and a streamed `INT8` scan from 56 to
+  114 ms. A preloaded scan is essentially unchanged at 37.6 ms, because after the one-time
+  load it reads the extension's own buffer and never returns to SQLite.
+- **The README benchmark table now compares hardware rather than modes**, two rows per
+  machine, with the peak memory measured rather than the configured limit read back.
+  `make benchmark HARDWARE="<your CPU>"` prints those rows ready to paste; it appends the
+  backend the build actually selected rather than trusting a hand-written label, and
+  refuses to print rows at all when the run's parameters differ from the ones the table is
+  built on.
+
+### Fixed
+
+- **Corrected a claim in the README**: TurboQuant was described as slower than the exact
+  scan, which was an artifact of measuring in memory. File-backed, `TURBO4` is **3.2x
+  faster** than the exact scan — it does beat brute force. What holds is the comparison
+  that mattered: `INT8` is 4x faster again at twice the index size, so TurboQuant's
+  argument is memory rather than throughput.
+
 ## [1.1.0] - 2026-08-24
 
 A source audit closed thirteen defects, including two crashes and four memory-safety
