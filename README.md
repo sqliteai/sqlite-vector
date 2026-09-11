@@ -465,7 +465,7 @@ You can deploy powerful similarity search capabilities right inside your app or 
 
 ## License
 
-Free Use in Open-Source Projects: You may use, copy, distribute, and prepare derivative works of the software — in source or object form, with or without modification — freely and without fee, provided the software is incorporated into or used by an open-source project licensed under an OSI-approved open-source license. Everything else is licensed under the [Elastic License 2.0](./LICENSE.md). You can use, copy, modify, and distribute it under the terms of the license for non-production use. For production or managed service use, please [contact SQLite Cloud, Inc](mailto:info@sqlitecloud.io) for a commercial license.
+This project is licensed under the [Apache License 2.0](./LICENSE.md).
 
 ---
 

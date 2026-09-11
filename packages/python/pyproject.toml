@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "build", "wheel"]
+requires = ["setuptools>=77.0.3", "build", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,7 @@ authors = [
     { name = "SQLite AI Team" }
 ]
 readme = "README.md"
-license = "LicenseRef-Elastic-2.0-Modified-For-Open-Source-Use"
+license = "Apache-2.0"
 license-files = ["LICENSE.md"]
 requires-python = ">=3"
 
