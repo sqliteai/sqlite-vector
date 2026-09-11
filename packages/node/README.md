@@ -1,7 +1,7 @@
 # @sqliteai/sqlite-vector
 
 [![npm version](https://badge.fury.io/js/@sqliteai%2Fsqlite-vector.svg)](https://badge.fury.io/js/@sqliteai%2Fsqlite-vector)
-[![License](https://img.shields.io/badge/license-Elastic%202.0-blue.svg)](LICENSE.md)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE.md)
 
 > SQLite Vector extension packaged for Node.js
 
@@ -140,9 +140,7 @@ Error thrown when the SQLite Vector extension cannot be found for the current pl
 
 ## License
 
-This project is licensed under the [Elastic License 2.0](LICENSE.md).
-
-For production or managed service use, please [contact SQLite Cloud, Inc](mailto:info@sqlitecloud.io) for a commercial license.
+This project is licensed under the [Apache License 2.0](LICENSE.md).
 
 ## Contributing
 

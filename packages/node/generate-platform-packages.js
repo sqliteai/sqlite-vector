@@ -99,7 +99,7 @@ function generatePackageJson(platform, version) {
       ...platform.name.split('-'),
     ],
     author: 'Gioele Cantoni (gioele@sqlitecloud.io)',
-    license: 'SEE LICENSE IN LICENSE.md',
+    license: 'Apache-2.0',
     repository: {
       type: 'git',
       url: 'https://github.com/sqliteai/sqlite-vector.git',
