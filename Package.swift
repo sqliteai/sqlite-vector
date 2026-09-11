@@ -14,8 +14,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "vectorBinary",
-            url: "https://github.com/sqliteai/sqlite-vector/releases/download/1.1.0/vector-apple-xcframework-1.1.0.zip",
-            checksum: "a9fc6606d86460d8bbfd946e257e2bc4f861a99525f584edf08e1056d71213e4"
+            url: "https://github.com/sqliteai/sqlite-vector/releases/download/1.1.2/vector-apple-xcframework-1.1.2.zip",
+            checksum: "05dd91fdb0c9c44aee844898c27eeaf8a9af1a740465a8343636b89ae1b7b5ee"
         ),
         .target(
             name: "vector",
