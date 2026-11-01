@@ -77,6 +77,14 @@ SQLITE_EXTENSION_INIT1
 #define MAX_TABLES                                  128
 #define STATIC_SQL_SIZE                             2048
 
+// A sanity bound on the declared vector dimension, which otherwise reached INT_MAX and
+// overflowed the size arithmetic downstream: (dim/2)*12 in turbo_rotation_plan_init()
+// wrapped negative past 357913941, which left its coordinate arrays unallocated and the
+// plan reported as valid, and the (dim + 7) expressions in the packing helpers are signed
+// overflow near the top of the range. 16M is some three orders of magnitude above any
+// real embedding and keeps every one of those computations far inside int.
+#define MAX_VECTOR_DIMENSION                        (1 << 24)
+
 #define INT64_TO_INT8PTR(_val, _ptr)                do { \
                                                     (_ptr)[0] = (int8_t)(((_val) >> 0)  & 0xFF); \
                                                     (_ptr)[1] = (int8_t)(((_val) >> 8)  & 0xFF); \
@@ -552,7 +560,11 @@ static int sqlite_unserialize (sqlite3_context *context, table_context *ctx) {
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
         if (rc != SQLITE_ROW) break;
         
+        // _sqliteai_vector is an ordinary writable table, and PRIMARY KEY on a rowid
+        // table does not imply NOT NULL: a row with a NULL key used to reach strcmp()
         const char *key = (const char *)sqlite3_column_text(vm, 0);
+        if (!key) continue;
+
         if (strcmp(key, OPTION_KEY_QUANTTYPE) == 0) {
             ctx->options.q_type = (vector_qtype)sqlite3_column_int(vm, 1);
             continue;
@@ -1584,10 +1596,15 @@ static bool parse_keyvalue_string (sqlite3_context *context, const char *str, ke
     return true;
 }
 
-static uint64_t human_to_number (const char *s) {
+// Returns false when the string is not a size at all, and writes the value out otherwise.
+// The previous version signalled failure by returning 0, which also made a literal "0"
+// unparseable - and zero is the one value the quantizer reads as "use whatever memory the
+// index needs", so that setting could not be expressed through the option string.
+static bool human_to_number (const char *s, uint64_t *out) {
     char *end = NULL;
     double d = strtod(s, &end);
-    if ((d == 0) || (d == HUGE_VAL)) return 0;
+    if (end == s) return false;         // no digits at all
+    if (!isfinite(d)) return false;     // overflowed to HUGE_VAL, or a NaN literal
     
     // skip whitespace before suffix
     SKIP_SPACES(end);
@@ -1596,11 +1613,12 @@ static uint64_t human_to_number (const char *s) {
     if (strncasecmp(end, "KB", 2) == 0) d *= 1024;
     else if (strncasecmp(end, "MB", 2) == 0) d *= 1024 * 1024;
     else if (strncasecmp(end, "GB", 2) == 0) d *= 1024 * 1024 * 1024;
-    else if (*end != 0) return 0; // invalid suffix
+    else if (*end != 0) return false;   // invalid suffix
     
     // sanity check
-    if (d < 0 || d > (double)INT64_MAX) return 0;
-    return (uint64_t)d;
+    if (d < 0 || d > (double)INT64_MAX) return false;
+    *out = (uint64_t)d;
+    return true;
 }
 
 bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char *key, int key_len, const char *value, int value_len) {
@@ -1626,9 +1644,13 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
     }
     
     if (KEY_MATCH(OPTION_KEY_DIMENSION)) {
-        int dimension = (int)strtol(buffer, NULL, 0);
-        if (dimension <= 0) return context_result_error(context, SQLITE_ERROR, "Invalid vector dimension: expected a positive integer, got '%s'", buffer);
-        options->v_dim = dimension;
+        // kept as a long until it has been range-checked: casting strtol()'s result to
+        // int first silently wrapped, so "4294967300" came through as the dimension 4
+        long dimension = strtol(buffer, NULL, 0);
+        if (dimension <= 0 || dimension > MAX_VECTOR_DIMENSION) {
+            return context_result_error(context, SQLITE_ERROR, "Invalid vector dimension: expected an integer between 1 and %d, got '%s'", MAX_VECTOR_DIMENSION, buffer);
+        }
+        options->v_dim = (int)dimension;
         return true;
     }
     
@@ -1639,8 +1661,11 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
     }
     
     if (KEY_MATCH(OPTION_KEY_MAXMEMORY)) {
-        uint64_t max_memory = human_to_number(buffer);
-        if (max_memory > 0) options->max_memory = max_memory;
+        uint64_t max_memory = 0;
+        // reported like every other unparseable option instead of being dropped, and 0 is
+        // now a value you can ask for: it means "use as much memory as the index needs"
+        if (!human_to_number(buffer, &max_memory)) return context_result_error(context, SQLITE_ERROR, "Invalid max_memory value: expected a size such as 64MB, got '%s'", buffer);
+        options->max_memory = max_memory;
         return true;
     }
     
@@ -1901,9 +1926,10 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     // max_memory == 0 means use all required memory
     if (max_memory == 0) {
         sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*) FROM \"%w\";", table_name);
-        int64_t count = sqlite_read_int64(db, sql);
-        max_memory = (count == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)count * (uint64_t)q_size;
-        if (count <= 0) {
+        // named apart from the caller's out-parameter, which it used to shadow
+        int64_t nrows = sqlite_read_int64(db, sql);
+        max_memory = (nrows == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)nrows * (uint64_t)q_size;
+        if (nrows <= 0) {
             // no vectors
             t_ctx->options.q_type = (qtype == VECTOR_QUANT_AUTO) ? VECTOR_QUANT_U8BIT : qtype;
             t_ctx->options.q_bits = q_bits;
@@ -2197,7 +2223,9 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
         int bytes = sqlite3_column_bytes(vm, 1);
         const uint8_t *data = (const uint8_t *)sqlite3_column_blob(vm, 1);
         
-        if (!data || n < 0 || bytes < 0 || (sqlite3_int64)bytes > required - seek) {
+        // n <= 0: every chunk this extension writes holds at least one vector, so a
+        // chunk claiming none is malformed and is caught here rather than at query time
+        if (!data || n <= 0 || bytes < 0 || (sqlite3_int64)bytes > required - seek) {
             rc = SQLITE_CORRUPT;
             break;
         }
@@ -2241,6 +2269,16 @@ static int vector_quantize (sqlite3_context *context, const char *table_name, co
     char sql[STATIC_SQL_SIZE];
     sqlite3 *db = sqlite3_context_db_handle(context);
     
+    // vector_rebuild_quantization() writes q_type/q_bits/scale/offset into t_ctx before
+    // the pass that can still fail, and the cleanup path below rolls the shadow table
+    // back. Snapshot them here so the in-memory description of the index goes back too:
+    // otherwise a failed call left the context describing a layout the table no longer
+    // has, and the next scan read the chunks at the wrong stride - wrong rowids, wrong
+    // distances, no error. Taken before the first goto so the label can always restore.
+    const vector_options saved_options = t_ctx->options;
+    const float saved_scale = t_ctx->scale;
+    const float saved_offset = t_ctx->offset;
+
     bool savepoint_open = false;
     rc = sqlite3_exec(db, "SAVEPOINT quantize;", NULL, NULL, NULL);
     if (rc != SQLITE_OK) goto quantize_cleanup;
@@ -2294,6 +2332,22 @@ quantize_cleanup: {
             sqlite3_exec(db, "RELEASE quantize;", NULL, NULL, NULL);
         }
         
+        // put the context back in step with the table the rollback restored. The turbo
+        // cache is keyed by (bits, dim) and rebuild() drops it whenever it quantizes to
+        // anything else, so a restored TURBO index needs it built again; if that fails
+        // the cache simply stays absent and the scans report SQLITE_MISUSE rather than
+        // reading at the wrong stride.
+        sqlite3_mutex_enter(qmutex);
+        t_ctx->options = saved_options;
+        t_ctx->scale = saved_scale;
+        t_ctx->offset = saved_offset;
+        if (t_ctx->options.q_type == VECTOR_QUANT_TURBO) {
+            if (table_context_ensure_turbo_codebook(t_ctx, t_ctx->options.q_bits, t_ctx->options.v_dim) == SQLITE_OK) {
+                table_context_ensure_turbo_plan(t_ctx, t_ctx->options.v_dim);
+            }
+        }
+        sqlite3_mutex_leave(qmutex);
+
         // only replace the message when SQLite actually has one: the callees set their own
         // through context_result_error, and overwriting it reported "not an error"
         if (errmsg) {
@@ -2382,22 +2436,33 @@ static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vec
     json++;
 
     
-    // count number of commas to estimate (over-estimate) the number of entries in the json
-    int estimated_count = 0;
+    // count number of commas to estimate (over-estimate) the number of entries in the
+    // json: a well-formed array of n elements carries n-1 commas, and a malformed one
+    // only ever parses into fewer. 64-bit, because a comma per byte of a maximum-length
+    // TEXT value overflows an int counter.
+    int64_t capacity = 1;
     for (const char *p = json; *p; ++p) {
-        if (*p == ',') estimated_count++;
+        if (*p == ',') ++capacity;
     }
-    
+
     // allocate blob
     // For BIT type, each JSON element is a single bit, pack 8 per byte
     size_t item_size = vector_type_to_size(type);
-    size_t alloc = (type == VECTOR_TYPE_BIT) ? ((estimated_count + 1) + 7) / 8 : (estimated_count + 1) * item_size;
-    blob = sqlite3_malloc((int)alloc);
+    // sqlite3_malloc() takes an int, so this byte count used to be truncated from a
+    // size_t while the write bound below was still derived from the untruncated value: a
+    // JSON array with 2^30 commas got an 8-byte buffer and a billion-element bound, and
+    // the parse loop wrote straight past it. The bound is now this same capacity rather
+    // than a figure recovered from the allocation, and sqlite3_malloc64() refuses
+    // anything near 2GB instead of wrapping.
+    sqlite3_uint64 alloc = (type == VECTOR_TYPE_BIT)
+                         ? (sqlite3_uint64)((capacity + 7) / 8)
+                         : (sqlite3_uint64)capacity * (sqlite3_uint64)item_size;
+    blob = sqlite3_malloc64(alloc);
     if (!blob) {
         return sqlite_common_set_error(context, vtab, SQLITE_NOMEM, "Out of memory: unable to allocate %lld bytes for BLOB buffer", (long long)alloc);
     }
     if (type == VECTOR_TYPE_BIT) {
-        memset(blob, 0, alloc);  // Initialize to zero for bit packing
+        memset(blob, 0, (size_t)alloc);  // Initialize to zero for bit packing
     }
 
     // typed pointers
@@ -2427,9 +2492,9 @@ static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vec
             return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Malformed JSON: expected a number at position %d (found '%c')", (int)(p - json) + 1, *p ? *p : '?');
         }
         
-        // check bounds
-        int max_count = (type == VECTOR_TYPE_BIT) ? (int)(alloc * 8) : (int)(alloc / item_size);
-        if (count >= max_count) {
+        // check bounds against the capacity the buffer was sized for, never against a
+        // count recovered from the allocation
+        if ((int64_t)count >= capacity) {
             sqlite3_free(blob);
             return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Too many elements in JSON array");
         }
@@ -2509,7 +2574,10 @@ static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vec
         return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Invalid JSON vector dimension: expected %d but found %d", dimension, count);
     }
 
-    if (size) *size = (type == VECTOR_TYPE_BIT) ? (int)((count + 7) / 8) : (int)(count * item_size);
+    // 64-bit arithmetic here too: the allocation above already caps count low enough that
+    // neither expression can overflow, but computing it in int left that guarantee resting
+    // on the allocator's limit rather than on anything stated locally
+    if (size) *size = (type == VECTOR_TYPE_BIT) ? (int)(((int64_t)count + 7) / 8) : (int)((int64_t)count * (int64_t)item_size);
     return blob;
 }
 
@@ -2520,7 +2588,15 @@ static void vector_as_type (sqlite3_context *context, vector_type type, int argc
     
     // dimension is an optional argument
     int dimension = (argc == 2) ? sqlite3_value_int(argv[1]) : 0;
-    
+
+    // held to the same bound as the dimension option, for the same reason: the size
+    // checks below go through vector_bytes_for_dim(), whose dim * item_size wraps where
+    // size_t is 32 bits, and a wrapped product would let a wrong-sized blob match
+    if (dimension > MAX_VECTOR_DIMENSION) {
+        context_result_error(context, SQLITE_ERROR, "Invalid dimension: expected an integer between 1 and %d, got %d", MAX_VECTOR_DIMENSION, dimension);
+        return;
+    }
+
     if (value_type == SQLITE_BLOB) {
         if (type == VECTOR_TYPE_BIT) {
             // For bit vectors, any size is valid (dimensions = size * 8, minus padding)
@@ -2529,18 +2605,32 @@ static void vector_as_type (sqlite3_context *context, vector_type type, int argc
                 size_t expected_size = vector_bytes_for_dim(type, dimension);
                 if ((size_t)value_size != expected_size) {
                     context_result_error(context, SQLITE_ERROR,
-                                         "Invalid BLOB size for format '%s': expected %d bytes for %d dimensions (got %d bytes)",
-                                         vector_type_to_name(type), (int)expected_size, dimension, value_size);
+                                         "Invalid BLOB size for format '%s': expected %lld bytes for %d dimensions (got %d bytes)",
+                                         vector_type_to_name(type), (long long)expected_size, dimension, value_size);
                     return;
                 }
             }
         } else {
-            // the only check we can perform is that the blob size is an exact multiplier of the vector type
+            // without a dimension the only check we can perform is that the blob size is
+            // an exact multiplier of the vector type
             if (value_size % vector_type_to_size(type) != 0) {
                 context_result_error(context, SQLITE_ERROR,
                                      "Invalid BLOB size for format '%s': size must be a multiple of %d bytes",
                                      vector_type_to_name(type), vector_type_to_size(type));
                 return;
+            }
+
+            // with one, hold the blob to it, as the BIT branch above and the JSON branch
+            // below already do: a wrong-sized vector is otherwise stored happily and then
+            // skipped in silence by every scan, so it never appears in any result
+            if (dimension > 0) {
+                size_t expected_size = vector_bytes_for_dim(type, dimension);
+                if ((size_t)value_size != expected_size) {
+                    context_result_error(context, SQLITE_ERROR,
+                                         "Invalid BLOB size for format '%s': expected %lld bytes for %d dimensions (got %d bytes)",
+                                         vector_type_to_name(type), (long long)expected_size, dimension, value_size);
+                    return;
+                }
             }
         }
         
@@ -2736,22 +2826,29 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     }
 
     if (c->row_count != k) {
+        // sqlite3_malloc() takes an int: k * sizeof() is a size_t and k comes straight
+        // from the query, so the byte count was silently truncated - k=536870913 asked
+        // for 0x100000008 bytes and got 8, which the memset below then overran.
+        // sqlite3_malloc64() refuses anything near 2GB, so an absurd k is a clean NOMEM.
+        //
+        // row_count also has to drop to zero before either allocation: it is what tells
+        // the next filter whether these arrays can be reused, and a cursor that failed
+        // half way through used to keep the old count next to one freed array.
         if (c->rowids) sqlite3_free(c->rowids);
-        c->rowids = (int64_t *)sqlite3_malloc(k * sizeof(int64_t));
-        if (c->rowids == NULL) {
-            if (vector_allocated) sqlite3_free((void *)vector);
-            return SQLITE_NOMEM;
-        }
-
         if (c->distance) sqlite3_free(c->distance);
-        c->distance = (double *)sqlite3_malloc(k * sizeof(double));
-        if (c->distance == NULL) {
+        c->rowids = NULL;
+        c->distance = NULL;
+        c->row_count = 0;
+
+        c->rowids = (int64_t *)sqlite3_malloc64((sqlite3_uint64)k * sizeof(int64_t));
+        c->distance = (double *)sqlite3_malloc64((sqlite3_uint64)k * sizeof(double));
+        if (c->rowids == NULL || c->distance == NULL) {
             if (vector_allocated) sqlite3_free((void *)vector);
             return SQLITE_NOMEM;
         }
     }
 
-    memset(c->rowids, 0, k * sizeof(int64_t));
+    memset(c->rowids, 0, (size_t)k * sizeof(int64_t));
     for (int i=0; i<k; ++i) c->distance[i] = INFINITY;
 
     c->size = 0;
@@ -2964,7 +3061,13 @@ static int vFullScanCursorNext (sqlite3_vtab_cursor *cur){
             c->stream.data = (uint8_t *)sqlite3_column_blob(vm, 1);
             c->stream.data_bytes = sqlite3_column_bytes(vm, 1);
             c->stream.dindex = 0;
-            if (c->stream.data == NULL || c->stream.dcounter < 0 || c->stream.data_bytes < 0 || (sqlite3_uint64)c->stream.data_bytes < (sqlite3_uint64)c->stream.dcounter * (sqlite3_uint64)total_stride) {
+            // dcounter == 0 is this loop's "load the next chunk" sentinel, so a chunk
+            // that claims zero vectors has to be rejected and not merely skipped: the
+            // length check below degenerates to "bytes < 0" and the row would then be
+            // read from past the end of the blob. vector_serialize_quantization() never
+            // writes such a chunk, so seeing one means the shadow table was tampered
+            // with - the same thing the counter and length tests here already guard.
+            if (c->stream.data == NULL || c->stream.dcounter <= 0 || c->stream.data_bytes < 0 || (sqlite3_uint64)c->stream.data_bytes < (sqlite3_uint64)c->stream.dcounter * (sqlite3_uint64)total_stride) {
                 return SQLITE_CORRUPT;
             }
         }
@@ -3045,7 +3148,9 @@ static int vFullScanCursorNext (sqlite3_vtab_cursor *cur){
         c->stream.data     = (uint8_t *)sqlite3_column_blob(vm, 1);
         c->stream.data_bytes = sqlite3_column_bytes(vm, 1);
         c->stream.dindex   = 0; // reset index for the new chunk
-        if (c->stream.data == NULL || c->stream.dcounter < 0 || c->stream.data_bytes < 0 ||
+        // dcounter <= 0, not < 0: zero is this loop's "chunk exhausted" sentinel, so a
+        // chunk claiming no vectors would otherwise be read past the end of its blob
+        if (c->stream.data == NULL || c->stream.dcounter <= 0 || c->stream.data_bytes < 0 ||
             (sqlite3_uint64)c->stream.data_bytes < (sqlite3_uint64)c->stream.dcounter * (sqlite3_uint64)total_stride) {
             return SQLITE_CORRUPT;
         }
@@ -3206,9 +3311,11 @@ static int vQuantRunMemory(vFullScanCursor *c, const preload_index *idx, uint8_t
     const size_t total_stride = rowid_size + vector_size;
 
     // the preloaded index is built from an ordinary writable table, so never trust its
-    // row count against its length (the TurboQuant paths already do this)
+    // row count against its length (the TurboQuant paths already do this). A count of
+    // zero over a non-empty buffer is malformed too - preload refuses to build an index
+    // with no bytes at all, so every chunk in it must claim at least one vector
     const sqlite3_int64 data_bytes = idx->bytes;
-    if (!data || counter < 0 || data_bytes < 0 || (sqlite3_uint64)data_bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
+    if (!data || counter <= 0 || data_bytes < 0 || (sqlite3_uint64)data_bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
         sqlite_vtab_set_error(c->base.pVtab, "Corrupted quantization data preloaded for '%s.%s'", c->table->t_name, c->table->c_name);
         return SQLITE_CORRUPT;
     }
@@ -3276,7 +3383,9 @@ static int vTurboRunPackedRows (vFullScanCursor *c, const uint8_t *data, sqlite3
     vector_distance distance_type = c->table->options.v_distance;
     size_t packed_bytes = turbo_bytes_for_dim(dim, bits);
     size_t total_stride = sizeof(int64_t) + sizeof(float) + packed_bytes;
-    if (!data || counter < 0 || data_bytes < 0 || (sqlite3_uint64)data_bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
+    // a chunk that carries bytes but claims no vectors is malformed, same as one whose
+    // count does not fit its length: reject it here as the streaming paths now do
+    if (!data || counter <= 0 || data_bytes < 0 || (sqlite3_uint64)data_bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
         return SQLITE_CORRUPT;
     }
 
@@ -3462,7 +3571,9 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         int counter = sqlite3_column_int(vm, 0);
         uint8_t *data = (uint8_t *)sqlite3_column_blob(vm, 1);
         int bytes = sqlite3_column_bytes(vm, 1);
-        if (!data || counter < 0 || bytes < 0 || (sqlite3_uint64)bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
+        // counter <= 0: a chunk with bytes but no vectors is as malformed as one whose
+        // count overruns its length, and the streaming paths reject it too
+        if (!data || counter <= 0 || bytes < 0 || (sqlite3_uint64)bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
             sqlite_vtab_set_error(c->base.pVtab, "Corrupted quantization data for '%s.%s'", c->table->t_name, c->table->c_name);
             sqlite3_finalize(vm);
             sqlite3_free(v);

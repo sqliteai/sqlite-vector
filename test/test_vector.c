@@ -1007,6 +1007,280 @@ static void test_distance_functions_hamming(sqlite3 *db) {
     }
 }
 
+/* ---------- Test: malformed input and failure paths ---------- */
+
+/* Like exec_scan_sql but keeps the step() return code, which the tests below need in
+   order to tell "rejected cleanly" from "produced a row it should not have". */
+static int run_scan(sqlite3 *db, const char *sql, scan_result *r) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (r->count < 64) {
+            r->ids[r->count] = sqlite3_column_int(stmt, 0);
+            r->distances[r->count] = sqlite3_column_double(stmt, 1);
+        }
+        r->count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? SQLITE_OK : rc;
+}
+
+static void test_malformed_input(sqlite3 *db) {
+    printf("\n=== Malformed input and failure paths ===\n");
+    char sql[1024];
+
+    /*
+     * A k whose byte count overflows an int. sqlite3_malloc() takes an int, so
+     * k=536870913 asked for 0x100000008 bytes, got 8, and the memset that follows
+     * overran the top-k arrays. It has to fail cleanly, and leave a usable cursor.
+     */
+    {
+        const char *tbl = "tbad_bigk";
+        if (setup_table(db, tbl, "f32", "L2", 4, float_vecs, float_nvecs) != 0) {
+            ASSERT(0, "huge k setup");
+        } else {
+            scan_result r = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_full_scan('%s','v',vector_as_f32('%s'),536870913);",
+                     tbl, float_query);
+            int rc = run_scan(db, sql, &r);
+            ASSERT(rc != SQLITE_OK, "huge k is rejected instead of overflowing the top-k arrays");
+
+            scan_result r2 = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_full_scan('%s','v',vector_as_f32('%s'),3);",
+                     tbl, float_query);
+            rc = run_scan(db, sql, &r2);
+            ASSERT(rc == SQLITE_OK && r2.count == 3, "a sane k still works after a huge one");
+        }
+    }
+
+    /*
+     * _sqliteai_vector is an ordinary writable table and PRIMARY KEY on a rowid table
+     * does not imply NOT NULL, so a row with a NULL key used to reach strcmp(NULL).
+     */
+    {
+        const char *tbl = "tbad_nullkey";
+        snprintf(sql, sizeof(sql), "CREATE TABLE \"%s\" (id INTEGER PRIMARY KEY, v BLOB);", tbl);
+        exec_sql(db, sql);
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO _sqliteai_vector (tblname,colname,key,value) VALUES ('%s','v',NULL,1);", tbl);
+        int rc = exec_sql(db, sql);
+        ASSERT(rc == SQLITE_OK, "a NULL metadata key can be stored");
+
+        snprintf(sql, sizeof(sql),
+                 "SELECT vector_init('%s','v','type=f32,dimension=4,distance=L2');", tbl);
+        rc = exec_sql(db, sql);
+        ASSERT(rc == SQLITE_OK, "vector_init skips a NULL metadata key instead of crashing");
+    }
+
+    /*
+     * A quant chunk that claims zero vectors. Zero is the streaming scans' "load the
+     * next chunk" sentinel, so such a chunk slipped past the length check and one row
+     * was read from past the end of its blob.
+     */
+    {
+        const char *tbl = "tbad_zerocount";
+        if (setup_table(db, tbl, "f32", "L2", 4, float_vecs, float_nvecs) != 0) {
+            ASSERT(0, "zero-count chunk setup");
+        } else {
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','v','qtype=UINT8');", tbl);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "zero-count chunk: quantize succeeds");
+
+            scan_result before = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s','v',vector_as_f32('%s'));",
+                     tbl, float_query);
+            ASSERT(run_scan(db, sql, &before) == SQLITE_OK, "zero-count chunk: scan works before tampering");
+
+            snprintf(sql, sizeof(sql),
+                     "INSERT INTO \"vector0_%s_v\" (rowid1,rowid2,counter,data) VALUES (0,0,0,x'00');", tbl);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "zero-count chunk can be stored");
+
+            scan_result streaming = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s','v',vector_as_f32('%s'));",
+                     tbl, float_query);
+            int rc = run_scan(db, sql, &streaming);
+            ASSERT(rc != SQLITE_OK, "streaming scan rejects a chunk claiming zero vectors");
+            ASSERT(streaming.count <= before.count, "streaming scan invents no extra row");
+
+            scan_result topk = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s','v',vector_as_f32('%s'),5);",
+                     tbl, float_query);
+            rc = run_scan(db, sql, &topk);
+            ASSERT(rc != SQLITE_OK, "top-k scan rejects a chunk claiming zero vectors");
+        }
+    }
+
+    /*
+     * A vector_quantize that fails part way through. The savepoint rolls the shadow
+     * table back, so the in-memory q_type/scale/offset have to go back too: otherwise
+     * the next scan reads the chunks at the wrong stride and reports made-up rowids.
+     * 1BIT skips the min/max pass, so the undersized blob is caught in the later one.
+     */
+    {
+        const char *tbl = "tbad_rollback";
+        if (setup_table(db, tbl, "f32", "L2", 4, float_vecs, float_nvecs) != 0) {
+            ASSERT(0, "quantize rollback setup");
+        } else {
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','v','qtype=UINT8');", tbl);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "quantize rollback: UINT8 quantize succeeds");
+
+            scan_result before = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s','v',vector_as_f32('%s'),5) ORDER BY distance;",
+                     tbl, float_query);
+            ASSERT(run_scan(db, sql, &before) == SQLITE_OK, "quantize rollback: scan works before");
+
+            snprintf(sql, sizeof(sql), "INSERT INTO \"%s\" (id, v) VALUES (9999, x'0001');", tbl);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "quantize rollback: undersized blob stored");
+
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','v','qtype=1BIT');", tbl);
+            ASSERT(exec_sql(db, sql) != SQLITE_OK, "quantize rollback: 1BIT quantize fails on the bad blob");
+
+            snprintf(sql, sizeof(sql), "DELETE FROM \"%s\" WHERE id = 9999;", tbl);
+            exec_sql(db, sql);
+
+            scan_result after = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s','v',vector_as_f32('%s'),5) ORDER BY distance;",
+                     tbl, float_query);
+            ASSERT(run_scan(db, sql, &after) == SQLITE_OK, "quantize rollback: scan still works after the failure");
+            ASSERT(after.count == before.count, "quantize rollback: same number of rows as before");
+
+            int same = (after.count == before.count);
+            for (int i = 0; same && i < after.count; i++) {
+                if (after.ids[i] != before.ids[i]) same = 0;
+                if (after.distances[i] != before.distances[i]) same = 0;
+            }
+            ASSERT(same, "quantize rollback: same rowids and distances as before the failed call");
+        }
+    }
+
+    /*
+     * The optional dimension argument has to hold a BLOB to the size it names, as it
+     * already did for TEXT and for BIT: a wrong-sized vector is otherwise stored and
+     * then skipped in silence by every scan.
+     */
+    {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, "SELECT length(vector_as_f32(x'0000000000000000', 4));", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        ASSERT(rc != SQLITE_ROW, "vector_as_f32 rejects a BLOB that does not match the given dimension");
+        sqlite3_finalize(stmt);
+
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT length(vector_as_f32(x'0000000000000000', 2));", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        ASSERT(rc == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 8, "vector_as_f32 accepts a BLOB of the right dimension");
+        sqlite3_finalize(stmt);
+
+        /*
+         * The size in the rejection message is a size_t behind a %lld, so it has to be
+         * reported whole. context_result_error() carries no printf format attribute, so
+         * nothing but a runtime check covers the conversion.
+         */
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT vector_as_f32(x'00000000', 16777216);", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        ASSERT(rc != SQLITE_ROW, "vector_as_f32 rejects a 4-byte BLOB offered as 16777216 dimensions");
+        {
+            const char *msg = sqlite3_errmsg(db);
+            ASSERT(msg && strstr(msg, "67108864") != NULL, "the rejection reports the expected size");
+            if (!msg || !strstr(msg, "67108864")) printf("  msg: %s\n", msg ? msg : "(none)");
+        }
+        sqlite3_finalize(stmt);
+
+        /* past the dimension bound it is refused before any size is computed at all */
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT vector_as_f32(x'00000000', 1073741824);", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        ASSERT(rc != SQLITE_ROW, "vector_as_f32 rejects a dimension past the bound");
+        sqlite3_finalize(stmt);
+
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT length(vector_as_f32(x'0000000000000000'));", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        ASSERT(rc == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 8, "vector_as_f32 still accepts a BLOB with no dimension given");
+        sqlite3_finalize(stmt);
+    }
+
+    /*
+     * An unbounded dimension overflowed the size arithmetic downstream. The one that
+     * crashed outright: (dim/2)*12 in turbo_rotation_plan_init() wraps negative past
+     * 357913941, which skipped the allocation of the coordinate arrays and still
+     * reported the plan as valid, so building a TurboQuant index on an EMPTY table
+     * wrote through a NULL pointer. The dimension is now range-checked where it is
+     * parsed, which is upstream of every one of those computations.
+     */
+    {
+        const char *tbl = "tbad_dim";
+        snprintf(sql, sizeof(sql), "CREATE TABLE \"%s\" (id INTEGER PRIMARY KEY, v BLOB);", tbl);
+        exec_sql(db, sql);
+
+        struct { const char *dim; int ok; const char *what; } cases[] = {
+            {"4",          1, "a small dimension is accepted"},
+            {"16777216",   1, "the largest allowed dimension is accepted"},
+            {"16777217",   0, "one past the bound is rejected"},
+            {"400000000",  0, "the dimension that overflowed the TurboQuant plan is rejected"},
+            {"2147483647", 0, "INT_MAX is rejected"},
+            /* (int)strtol() used to wrap this to 4 and accept it as a valid dimension */
+            {"4294967300", 0, "a value above INT_MAX is rejected, not wrapped"},
+        };
+
+        for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+            char msg[160];
+            /* a fresh column name each time: vector_init keeps the first dimension it
+               is given for a table/column pair and rejects later disagreements */
+            snprintf(sql, sizeof(sql), "ALTER TABLE \"%s\" ADD COLUMN c%u BLOB;", tbl, i);
+            exec_sql(db, sql);
+            snprintf(sql, sizeof(sql), "SELECT vector_init('%s','c%u','type=f32,dimension=%s');", tbl, i, cases[i].dim);
+            int rc = exec_sql(db, sql);
+            snprintf(msg, sizeof(msg), "dimension=%s: %s", cases[i].dim, cases[i].what);
+            ASSERT(cases[i].ok ? (rc == SQLITE_OK) : (rc != SQLITE_OK), msg);
+        }
+
+        /* and the quantize that used to crash is now unreachable: init refuses first */
+        snprintf(sql, sizeof(sql), "ALTER TABLE \"%s\" ADD COLUMN turbo BLOB;", tbl);
+        exec_sql(db, sql);
+        snprintf(sql, sizeof(sql), "SELECT vector_init('%s','turbo','type=f32,dimension=400000000,distance=COSINE');", tbl);
+        ASSERT(exec_sql(db, sql) != SQLITE_OK, "the TurboQuant crash case is refused at vector_init");
+        snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','turbo','qtype=TURBO');", tbl);
+        ASSERT(exec_sql(db, sql) != SQLITE_OK, "and vector_quantize on it reports no context instead of crashing");
+    }
+
+    /*
+     * max_memory: 0 is a real setting ("use whatever the index needs") and used to be
+     * indistinguishable from a parse failure, which was itself silently ignored.
+     */
+    {
+        const char *tbl = "tbad_maxmemory";
+        if (setup_table(db, tbl, "f32", "L2", 4, float_vecs, float_nvecs) != 0) {
+            ASSERT(0, "max_memory setup");
+        } else {
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','v','qtype=UINT8,max_memory=0');", tbl);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "max_memory=0 is accepted");
+
+            scan_result r = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s','v',vector_as_f32('%s'),5);",
+                     tbl, float_query);
+            ASSERT(run_scan(db, sql, &r) == SQLITE_OK && r.count == 5, "max_memory=0 quantizes a usable index");
+
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','v','qtype=UINT8,max_memory=banana');", tbl);
+            ASSERT(exec_sql(db, sql) != SQLITE_OK, "an unparseable max_memory is reported, not ignored");
+
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','v','qtype=UINT8,max_memory=1MB');", tbl);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "max_memory with a unit suffix is accepted");
+        }
+    }
+}
+
 /* ---------- Main ---------- */
 
 int main(void) {
@@ -1217,6 +1491,9 @@ int main(void) {
         test_distance_functions_int(db);
         test_distance_functions_hamming(db);
     }
+
+    /* 6. malformed input and failure paths */
+    test_malformed_input(db);
 
 
     sqlite3_close(db);
