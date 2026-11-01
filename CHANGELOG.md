@@ -4,10 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [1.2.0] - 2026-11-01
 
-Documentation and tooling only — the extension itself is unchanged from 1.1.0, so a build
-from this revision produces the same binaries.
+A read-through of the sources, followed by a security review of all of `src/`, turned up
+ten bugs. Three of them write outside their buffers and are reachable from ordinary SQL,
+so upgrading is recommended for anyone whose application lets untrusted input reach a
+connection with the extension loaded. No API changed and no index needs rebuilding.
 
 ### Changed
 
@@ -32,6 +34,63 @@ from this revision produces the same binaries.
   faster** than the exact scan — it does beat brute force. What holds is the comparison
   that mattered: `INT8` is 4x faster again at twice the index size, so TurboQuant's
   argument is memory rather than throughput.
+- **A `NULL` key in `_sqliteai_vector` crashed the next `vector_init()`.** That table is
+  an ordinary writable one, and `PRIMARY KEY` on a rowid table does not imply `NOT NULL`,
+  so the key went to `strcmp()` unchecked. Such rows are now skipped.
+- **A failed `vector_quantize()` left the extension describing an index that no longer
+  existed.** The quantization type, bit width, scale and offset are written into the table
+  context before the pass that can still fail, and the savepoint rolls the shadow table
+  back without them. Scans then read the chunks at the wrong stride and reported made-up
+  rowids and distances with no error at all. Those fields, and the TurboQuant cache, are
+  now restored along with the rollback.
+- **A quant chunk claiming zero vectors was read past the end of its blob.** Zero is the
+  streaming scans' "load the next chunk" sentinel, so such a chunk slipped past the length
+  check beside it, which degenerates to `bytes < 0`, and one fabricated row came back.
+  Every count test now rejects it, and `vector_quantize_preload()` catches it at load time
+  rather than leaving it to query time.
+- **`vector_as_*()` ignored its optional dimension argument for BLOB input**, though it is
+  documented as a stricter check and the `BIT` and JSON paths already enforced it. A
+  wrong-sized vector was stored and then skipped in silence by every scan, so it never
+  appeared in a result.
+- **`max_memory=0` could not be set, and an unparseable value was dropped silently.** Zero
+  is the one value the quantizer reads as "use whatever memory the index needs", but the
+  parser used a `0` return to signal failure, so the two were indistinguishable. A bad
+  `max_memory` is now reported like every other invalid option.
+- **The `INT8` and `UINT8` cosine kernels accumulated in 32 bits** in the scalar and SSE2
+  backends, wrapping around past roughly 133k and 66k dimensions; NEON, AVX2 and AVX-512
+  already used 64-bit accumulators. SSE2 now also computes `sqrt(a)*sqrt(b)` like every
+  other backend instead of `sqrtf(a*b)`, which could overflow in `float`, so all five
+  compute the same cosine.
+
+### Security
+
+- **Out-of-bounds write from a large `k`.** The top-k arrays were allocated with
+  `sqlite3_malloc()`, whose parameter is an `int`, from a `size_t` byte count. `k` comes
+  straight from the query, so `k=536870913` asked for `0x100000008` bytes, got 8, and the
+  `memset` that follows overran them. Both allocations now go through
+  `sqlite3_malloc64()`, so an absurd `k` is a clean `SQLITE_NOMEM`. Manifests as a crash:
+  the length is not controllable and the value written is zero.
+- **Heap buffer overflow in JSON vector parsing.** `vector_from_json()` sized its buffer
+  and bounded its writes from two different numbers — the buffer from
+  `sqlite3_malloc((int)alloc)`, which truncated a `size_t`, and the bound from the
+  untruncated `alloc`. A JSON array with 2^30 commas got an 8-byte buffer and a bound of
+  1073741825 elements, and the parse loop wrote `float`s of the caller's choosing straight
+  past it; the comma count sizes the buffer to the byte, which makes this a precise write
+  primitive rather than a crash. Reachable through any `vector_as_*()` and through the TEXT
+  query-vector argument of both scans. It took a TEXT value of about a gigabyte, so a host
+  built with `SQLITE_MAX_LENGTH >= 1073741824` — the limit that applies is the host's,
+  since this ships as a loadable extension. There is now a single capacity in 64 bits: the
+  allocation uses `sqlite3_malloc64()` and the loop checks against that same number.
+- **Null write from an unbounded `dimension`.** The declared dimension was only checked
+  for being positive, so it reached `INT_MAX` and overflowed the size arithmetic
+  downstream. `(dim/2)*12` in the TurboQuant rotation plan wraps negative past 357913941,
+  which skipped the allocation of the plan's coordinate arrays and still reported the plan
+  as valid; `vector_init` with `dimension=400000000` followed by a TurboQuant
+  `vector_quantize` then crashed the process on an empty table, since the plan is built
+  before any row is read. Dimensions are now bounded at 2^24 where they are parsed, which
+  is upstream of every one of those computations — and of the signed-overflow `dim + 7`
+  expressions in the packing helpers. A dimension above `INT_MAX` is also rejected rather
+  than wrapped: `4294967300` used to come through as the dimension 4.
 
 ## [1.1.0] - 2026-08-24
 
