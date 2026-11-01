@@ -786,9 +786,11 @@ float uint8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
     _mm_storeu_si128((__m128i *)a2, acc_a2);
     _mm_storeu_si128((__m128i *)b2, acc_b2);
 
-    int32_t total_dot = dot[0] + dot[1] + dot[2] + dot[3];
-    int32_t total_a2  = a2[0] + a2[1] + a2[2] + a2[3];
-    int32_t total_b2  = b2[0] + b2[1] + b2[2] + b2[3];
+    // 64-bit totals, as the NEON/AVX2/AVX-512 kernels use: the four lanes together can
+    // hold more than a 32-bit sum, and the scalar tail adds to the same running total
+    int64_t total_dot = (int64_t)dot[0] + dot[1] + dot[2] + dot[3];
+    int64_t total_a2  = (int64_t)a2[0] + a2[1] + a2[2] + a2[3];
+    int64_t total_b2  = (int64_t)b2[0] + b2[1] + b2[2] + b2[3];
 
     for (; i < n; ++i) {
         int va = (int)a[i];
@@ -798,9 +800,9 @@ float uint8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
         total_b2  += vb * vb;
     }
 
-    float denom = sqrtf((float)total_a2 * (float)total_b2);
-    if (denom == 0.0f) return 1.0f; // orthogonal or zero
-    float cosine_sim = total_dot / denom;
+    double denom = sqrt((double)total_a2) * sqrt((double)total_b2);
+    if (denom == 0.0) return 1.0f; // orthogonal or zero
+    float cosine_sim = (float)((double)total_dot / denom);
     if (cosine_sim > 1.0f) cosine_sim = 1.0f;
     if (cosine_sim < -1.0f) cosine_sim = -1.0f;
     return 1.0f - cosine_sim; // cosine distance
@@ -1003,9 +1005,11 @@ float int8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
     _mm_storeu_si128((__m128i *)_a, acc_a2);
     _mm_storeu_si128((__m128i *)_b, acc_b2);
 
-    int32_t total_dot = _d[0] + _d[1] + _d[2] + _d[3];
-    int32_t total_a2  = _a[0] + _a[1] + _a[2] + _a[3];
-    int32_t total_b2  = _b[0] + _b[1] + _b[2] + _b[3];
+    // 64-bit totals, as the NEON/AVX2/AVX-512 kernels use: the four lanes together can
+    // hold more than a 32-bit sum, and the scalar tail adds to the same running total
+    int64_t total_dot = (int64_t)_d[0] + _d[1] + _d[2] + _d[3];
+    int64_t total_a2  = (int64_t)_a[0] + _a[1] + _a[2] + _a[3];
+    int64_t total_b2  = (int64_t)_b[0] + _b[1] + _b[2] + _b[3];
 
     // Handle tail
     for (; i < n; ++i) {
@@ -1016,9 +1020,9 @@ float int8_distance_cosine_sse2 (const void *v1, const void *v2, int n) {
         total_b2  += vb * vb;
     }
 
-    float denom = sqrtf((float)total_a2 * (float)total_b2);
-    if (denom == 0.0f) return 1.0f;
-    float cosine_sim = total_dot / denom;
+    double denom = sqrt((double)total_a2) * sqrt((double)total_b2);
+    if (denom == 0.0) return 1.0f;
+    float cosine_sim = (float)((double)total_dot / denom);
     if (cosine_sim > 1.0f) cosine_sim = 1.0f;
     if (cosine_sim < -1.0f) cosine_sim = -1.0f;
     return 1.0f - cosine_sim;
