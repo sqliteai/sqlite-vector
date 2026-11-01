@@ -77,6 +77,14 @@ SQLITE_EXTENSION_INIT1
 #define MAX_TABLES                                  128
 #define STATIC_SQL_SIZE                             2048
 
+// A sanity bound on the declared vector dimension, which otherwise reached INT_MAX and
+// overflowed the size arithmetic downstream: (dim/2)*12 in turbo_rotation_plan_init()
+// wrapped negative past 357913941, which left its coordinate arrays unallocated and the
+// plan reported as valid, and the (dim + 7) expressions in the packing helpers are signed
+// overflow near the top of the range. 16M is some three orders of magnitude above any
+// real embedding and keeps every one of those computations far inside int.
+#define MAX_VECTOR_DIMENSION                        (1 << 24)
+
 #define INT64_TO_INT8PTR(_val, _ptr)                do { \
                                                     (_ptr)[0] = (int8_t)(((_val) >> 0)  & 0xFF); \
                                                     (_ptr)[1] = (int8_t)(((_val) >> 8)  & 0xFF); \
@@ -1636,9 +1644,13 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
     }
     
     if (KEY_MATCH(OPTION_KEY_DIMENSION)) {
-        int dimension = (int)strtol(buffer, NULL, 0);
-        if (dimension <= 0) return context_result_error(context, SQLITE_ERROR, "Invalid vector dimension: expected a positive integer, got '%s'", buffer);
-        options->v_dim = dimension;
+        // kept as a long until it has been range-checked: casting strtol()'s result to
+        // int first silently wrapped, so "4294967300" came through as the dimension 4
+        long dimension = strtol(buffer, NULL, 0);
+        if (dimension <= 0 || dimension > MAX_VECTOR_DIMENSION) {
+            return context_result_error(context, SQLITE_ERROR, "Invalid vector dimension: expected an integer between 1 and %d, got '%s'", MAX_VECTOR_DIMENSION, buffer);
+        }
+        options->v_dim = (int)dimension;
         return true;
     }
     
@@ -2424,22 +2436,33 @@ static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vec
     json++;
 
     
-    // count number of commas to estimate (over-estimate) the number of entries in the json
-    int estimated_count = 0;
+    // count number of commas to estimate (over-estimate) the number of entries in the
+    // json: a well-formed array of n elements carries n-1 commas, and a malformed one
+    // only ever parses into fewer. 64-bit, because a comma per byte of a maximum-length
+    // TEXT value overflows an int counter.
+    int64_t capacity = 1;
     for (const char *p = json; *p; ++p) {
-        if (*p == ',') estimated_count++;
+        if (*p == ',') ++capacity;
     }
-    
+
     // allocate blob
     // For BIT type, each JSON element is a single bit, pack 8 per byte
     size_t item_size = vector_type_to_size(type);
-    size_t alloc = (type == VECTOR_TYPE_BIT) ? ((estimated_count + 1) + 7) / 8 : (estimated_count + 1) * item_size;
-    blob = sqlite3_malloc((int)alloc);
+    // sqlite3_malloc() takes an int, so this byte count used to be truncated from a
+    // size_t while the write bound below was still derived from the untruncated value: a
+    // JSON array with 2^30 commas got an 8-byte buffer and a billion-element bound, and
+    // the parse loop wrote straight past it. The bound is now this same capacity rather
+    // than a figure recovered from the allocation, and sqlite3_malloc64() refuses
+    // anything near 2GB instead of wrapping.
+    sqlite3_uint64 alloc = (type == VECTOR_TYPE_BIT)
+                         ? (sqlite3_uint64)((capacity + 7) / 8)
+                         : (sqlite3_uint64)capacity * (sqlite3_uint64)item_size;
+    blob = sqlite3_malloc64(alloc);
     if (!blob) {
         return sqlite_common_set_error(context, vtab, SQLITE_NOMEM, "Out of memory: unable to allocate %lld bytes for BLOB buffer", (long long)alloc);
     }
     if (type == VECTOR_TYPE_BIT) {
-        memset(blob, 0, alloc);  // Initialize to zero for bit packing
+        memset(blob, 0, (size_t)alloc);  // Initialize to zero for bit packing
     }
 
     // typed pointers
@@ -2469,9 +2492,9 @@ static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vec
             return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Malformed JSON: expected a number at position %d (found '%c')", (int)(p - json) + 1, *p ? *p : '?');
         }
         
-        // check bounds
-        int max_count = (type == VECTOR_TYPE_BIT) ? (int)(alloc * 8) : (int)(alloc / item_size);
-        if (count >= max_count) {
+        // check bounds against the capacity the buffer was sized for, never against a
+        // count recovered from the allocation
+        if ((int64_t)count >= capacity) {
             sqlite3_free(blob);
             return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Too many elements in JSON array");
         }
@@ -2551,7 +2574,10 @@ static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vec
         return sqlite_common_set_error(context, vtab, SQLITE_ERROR, "Invalid JSON vector dimension: expected %d but found %d", dimension, count);
     }
 
-    if (size) *size = (type == VECTOR_TYPE_BIT) ? (int)((count + 7) / 8) : (int)(count * item_size);
+    // 64-bit arithmetic here too: the allocation above already caps count low enough that
+    // neither expression can overflow, but computing it in int left that guarantee resting
+    // on the allocator's limit rather than on anything stated locally
+    if (size) *size = (type == VECTOR_TYPE_BIT) ? (int)(((int64_t)count + 7) / 8) : (int)((int64_t)count * (int64_t)item_size);
     return blob;
 }
 
@@ -2562,7 +2588,15 @@ static void vector_as_type (sqlite3_context *context, vector_type type, int argc
     
     // dimension is an optional argument
     int dimension = (argc == 2) ? sqlite3_value_int(argv[1]) : 0;
-    
+
+    // held to the same bound as the dimension option, for the same reason: the size
+    // checks below go through vector_bytes_for_dim(), whose dim * item_size wraps where
+    // size_t is 32 bits, and a wrapped product would let a wrong-sized blob match
+    if (dimension > MAX_VECTOR_DIMENSION) {
+        context_result_error(context, SQLITE_ERROR, "Invalid dimension: expected an integer between 1 and %d, got %d", MAX_VECTOR_DIMENSION, dimension);
+        return;
+    }
+
     if (value_type == SQLITE_BLOB) {
         if (type == VECTOR_TYPE_BIT) {
             // For bit vectors, any size is valid (dimensions = size * 8, minus padding)

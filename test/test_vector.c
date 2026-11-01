@@ -1181,21 +1181,26 @@ static void test_malformed_input(sqlite3 *db) {
         sqlite3_finalize(stmt);
 
         /*
-         * A dimension whose byte count does not fit in an int. The size is a size_t and
-         * the message has to report it whole: with a %d it printed "expected 0 bytes".
-         * context_result_error() carries no printf format attribute, so nothing but a
-         * runtime check catches this.
+         * The size in the rejection message is a size_t behind a %lld, so it has to be
+         * reported whole. context_result_error() carries no printf format attribute, so
+         * nothing but a runtime check covers the conversion.
          */
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT vector_as_f32(x'00000000', 16777216);", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+        ASSERT(rc != SQLITE_ROW, "vector_as_f32 rejects a 4-byte BLOB offered as 16777216 dimensions");
+        {
+            const char *msg = sqlite3_errmsg(db);
+            ASSERT(msg && strstr(msg, "67108864") != NULL, "the rejection reports the expected size");
+            if (!msg || !strstr(msg, "67108864")) printf("  msg: %s\n", msg ? msg : "(none)");
+        }
+        sqlite3_finalize(stmt);
+
+        /* past the dimension bound it is refused before any size is computed at all */
         stmt = NULL;
         rc = sqlite3_prepare_v2(db, "SELECT vector_as_f32(x'00000000', 1073741824);", -1, &stmt, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
-        ASSERT(rc != SQLITE_ROW, "vector_as_f32 rejects a dimension whose byte count overflows an int");
-        {
-            const char *msg = sqlite3_errmsg(db);
-            ASSERT(msg && strstr(msg, "4294967296") != NULL,
-                   "the rejection reports the untruncated expected size");
-            if (!msg || !strstr(msg, "4294967296")) printf("  msg: %s\n", msg ? msg : "(none)");
-        }
+        ASSERT(rc != SQLITE_ROW, "vector_as_f32 rejects a dimension past the bound");
         sqlite3_finalize(stmt);
 
         stmt = NULL;
@@ -1203,6 +1208,50 @@ static void test_malformed_input(sqlite3 *db) {
         if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
         ASSERT(rc == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 8, "vector_as_f32 still accepts a BLOB with no dimension given");
         sqlite3_finalize(stmt);
+    }
+
+    /*
+     * An unbounded dimension overflowed the size arithmetic downstream. The one that
+     * crashed outright: (dim/2)*12 in turbo_rotation_plan_init() wraps negative past
+     * 357913941, which skipped the allocation of the coordinate arrays and still
+     * reported the plan as valid, so building a TurboQuant index on an EMPTY table
+     * wrote through a NULL pointer. The dimension is now range-checked where it is
+     * parsed, which is upstream of every one of those computations.
+     */
+    {
+        const char *tbl = "tbad_dim";
+        snprintf(sql, sizeof(sql), "CREATE TABLE \"%s\" (id INTEGER PRIMARY KEY, v BLOB);", tbl);
+        exec_sql(db, sql);
+
+        struct { const char *dim; int ok; const char *what; } cases[] = {
+            {"4",          1, "a small dimension is accepted"},
+            {"16777216",   1, "the largest allowed dimension is accepted"},
+            {"16777217",   0, "one past the bound is rejected"},
+            {"400000000",  0, "the dimension that overflowed the TurboQuant plan is rejected"},
+            {"2147483647", 0, "INT_MAX is rejected"},
+            /* (int)strtol() used to wrap this to 4 and accept it as a valid dimension */
+            {"4294967300", 0, "a value above INT_MAX is rejected, not wrapped"},
+        };
+
+        for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+            char msg[160];
+            /* a fresh column name each time: vector_init keeps the first dimension it
+               is given for a table/column pair and rejects later disagreements */
+            snprintf(sql, sizeof(sql), "ALTER TABLE \"%s\" ADD COLUMN c%u BLOB;", tbl, i);
+            exec_sql(db, sql);
+            snprintf(sql, sizeof(sql), "SELECT vector_init('%s','c%u','type=f32,dimension=%s');", tbl, i, cases[i].dim);
+            int rc = exec_sql(db, sql);
+            snprintf(msg, sizeof(msg), "dimension=%s: %s", cases[i].dim, cases[i].what);
+            ASSERT(cases[i].ok ? (rc == SQLITE_OK) : (rc != SQLITE_OK), msg);
+        }
+
+        /* and the quantize that used to crash is now unreachable: init refuses first */
+        snprintf(sql, sizeof(sql), "ALTER TABLE \"%s\" ADD COLUMN turbo BLOB;", tbl);
+        exec_sql(db, sql);
+        snprintf(sql, sizeof(sql), "SELECT vector_init('%s','turbo','type=f32,dimension=400000000,distance=COSINE');", tbl);
+        ASSERT(exec_sql(db, sql) != SQLITE_OK, "the TurboQuant crash case is refused at vector_init");
+        snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s','turbo','qtype=TURBO');", tbl);
+        ASSERT(exec_sql(db, sql) != SQLITE_OK, "and vector_quantize on it reports no context instead of crashing");
     }
 
     /*
